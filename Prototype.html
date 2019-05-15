@@ -1,0 +1,230 @@
+<html>
+<head>
+ <link rel="stylesheet" a href="code.css">
+	<title>Next</title>
+	<style>
+	input[type=submit]
+	{
+		width: 20%;
+		background-color: #4CAF50;
+		color: white;
+		padding: 8px 20px;
+		margin: 6px 0;
+		border: none;
+		border-radius: 6px;
+		cursor: pointer;
+	}
+  #byte_content {
+    margin: 5px 0;
+    max-height: 100px;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+  #byte_range { margin-top: 5px; }
+</style>
+<body  >
+	<input type="file" id="files" name="file" /> <br><br>
+	<span class="readBytesButtons">
+	  <button>Submit</button><br><br>
+	</span>
+
+<form action="page4.html">
+		<input type="submit" value="See Statistics">
+</form>
+<div id="coloursmells"></div>
+<script>
+	var alc=[];
+    var aldc=[];
+    var alm=[];
+    var aldm=[];
+    var alp=[];
+	var s;
+			  function readBlob(opt_startByte, opt_stopByte)
+			  {
+
+				var files = document.getElementById('files').files;
+				if (!files.length) {
+				  alert('Please select a file!');
+				  return;
+				}
+
+				var file = files[0];
+				var start = parseInt(opt_startByte) || 0;
+				var stop = parseInt(opt_stopByte) || file.size - 1;
+
+				var reader = new FileReader();
+
+				// If we use onloadend, we need to check the readyState.
+				reader.onloadend = function(evt) {
+				  if (evt.target.readyState == FileReader.DONE) { // DONE == 2
+				  var x=evt.target.result;
+				  var array= x.match(/[^\r\n]+/g);
+				  s=array;
+				  var len=array.length;
+				  
+				  var n1;
+				  var n2;
+				  var lclass=0;//long class
+				  var ldclass=0;//long data classes
+				  var ldmethod=0;//long data method
+				  var lpara=0;//long method parameters
+				  var lmethod=0;//long methods
+				  var u=0;
+				  var paralist=0;//data list
+				  var longclass=0;//no. of kines in class
+				  for(var j=0;j<len;j++)
+				  {
+					if(array[j].search("using")>=0)
+					{
+						u++;
+						
+					}
+					if(array[j].search("class")>=0)
+					{
+						
+						if(paralist>20)
+						{
+							ldclass++;
+							aldc.push(n1);
+						}
+						paralist=0;
+						if(longclass>50)
+						{
+							lclass++;
+							alc.push(n1);
+						}
+						longclass=0;
+						n1=j;
+						
+					}
+					else
+					{
+						longclass++;
+					}
+					if(array[j].search("private")>=0 || array[j].search("public")>=0 || array[j].search("protected")>=0 || array[j].search	("const")>=0 || array[j].search("void")>=0   )
+					{
+						if(array[j].search(";")>=0 )
+						{
+							paralist++;
+						}
+						else 
+						{   
+							n2=j;
+							var lm=0;
+							var ld=0;
+							var p=(array[j].match(/,/g)||[]).length;
+							if(p>=3)
+							{
+								lpara++;
+								alp.push(j);
+							}
+							j=j+2;
+							var lb=0;
+							while(array[j].search("}")<0)
+							{
+								lm++;
+								if(array[j].search("{")>=0)
+								{
+									lb++;
+								}
+								if(array[j].search("int")>=0 || array[j].search("float")>=0 || array[j].search("bool")>=0 || array[j].search("long")>=0)
+								{
+									ld++;
+								} 
+								if(lb==0)
+								{
+									j++;
+									lm++;
+								}
+								else if(array[j].search("}")>=0)
+								{
+									lb--;
+								}
+								j++;
+							}
+							if(lm>=30)
+							{
+								lmethod++;
+								alm.push(n2);
+							}
+							if(ld>10)
+							{
+								ldmethod++;
+								aldm.push(n2);
+							}
+							paralist=paralist+ld;
+						}
+						
+					}
+					
+				  }	
+						  var text="";
+						  var colour="";
+						  for(var j=0;j<s.length;j++)
+						  {
+								if(alc.includes(j))
+								{
+									text = s[j]+".......................#LONG CLASS SMELL"+"<br>" ; 
+									var result = text.fontcolor("crimson");
+									colour+=result;	
+								}
+								
+								else if(aldc.includes(j))
+								{
+									text = s[j]+".......................#LONG DATA SMELL"+"<br>" ; 
+									var result = text.fontcolor("DarkRed");
+									colour+=result;	
+									
+								}
+								else if(alm.includes(j))
+								{
+									text = s[j]+".......................#LONG METHOD SMELL"+"<br>" ; 
+									var result = text.fontcolor("DeepPink");
+									colour+=result;	
+								}
+								else if(aldm.includes(j))
+								{
+									text = s[j]+".......................#LONG DATA METHOD SMELL"+"<br>" ;
+									var result = text.fontcolor("Fuchsia");
+									colour+=result;	
+								}
+								else if(alp.includes(j))
+								{
+									text = s[j]+".......................#LONG PARAMETERS"+"<br>" ; 
+									var result = text.fontcolor("OrangeRed");
+									colour+=result;	
+								}
+								else if(s[j].search("using")>=0 && s[j].search("//"))
+								{
+									text = s[j]+".......................#INHERITED SMELL"+"<br>" ; 
+									var result = text.fontcolor("RoyalBlue");
+									colour+=result;	
+									
+								}
+								else
+								{
+									text = s[j]+"<br>" ; 
+									var result = text.fontcolor("black");
+									colour+=result;	
+								}			
+						  }
+						  document.getElementById('coloursmells').innerHTML=colour;
+					  }
+				};
+
+				var blob = file.slice(start, stop + 1);
+				reader.readAsBinaryString(blob);
+			  }
+			  
+			  document.querySelector('.readBytesButtons').addEventListener('click', function(evt)
+				  {
+					if (evt.target.tagName.toLowerCase() == 'button') 
+					{
+					  var startByte = evt.target.getAttribute('data-startbyte');
+					  var endByte = evt.target.getAttribute('data-endbyte');
+					  readBlob(startByte, endByte);
+					}
+				  }, false);			
+</script>
+</body>
+</html>

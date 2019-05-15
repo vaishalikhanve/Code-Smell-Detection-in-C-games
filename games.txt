@@ -1,0 +1,4144 @@
+using System;
+using UnityEngine;
+
+public class Arrow : MonoBehaviour
+{
+ public Material AlwaysOnTopMaterial;
+
+ public Material TransparentMaterial;
+
+ public bool AlwaysOnTop
+ {
+  set
+  {
+   GetComponent<Renderer>().sharedMaterial = value ? AlwaysOnTopMaterial : TransparentMaterial;
+  }
+ }
+}
+using System;
+using UnityEngine;
+using System.Linq;
+using System.Diagnostics;
+using System.Collections.Generic;
+using System.Text;
+using UnityEngine.UI;
+using System.Collections;
+
+public class DosBox : MonoBehaviour
+{
+ public Text RightText;
+ public BoxInfo BoxInfo;
+ public GameObject Actors;
+ public Arrow Arrow;
+ public Box BoxPrefab;
+ public uint InternalTimer;
+ public bool ShowAdditionalInfo;
+ public ProcessMemoryReader ProcessReader;
+ public Box Player;
+
+ //initial player position
+ private int dosBoxPattern;
+ private byte[][][] PlayerInitialPosition = new byte[][][]
+ {
+  new byte[][] { new byte[] { 0x9F, 0x0C, 0x00, 0x00, 0xF4, 0xF9, 0x9F, 0x0C, 0x00, 0x00, 0xF4, 0xF9 } }, //AITD1
+  new byte[][] { new byte[] { 0x43, 0x01, 0x00, 0x00, 0xD0, 0xE4, 0x43, 0x01, 0x00, 0x00, 0xD0, 0xE4 } }, //AIID2
+  new byte[][]
+  {
+   new byte[] { 0x3F, 0x03, 0x00, 0x00, 0x00, 0x00, 0x3F, 0x03, 0x00, 0x00, 0x00, 0x00 }, //AITD3
+   new byte[] { 0x27, 0x03, 0x00, 0x00, 0x00, 0x00, 0x27, 0x03, 0x00, 0x00, 0x00, 0x00 }  //AITD3 (after restart)
+  }
+ };
+
+ private int[] MemoryOffsets = new [] { -188, -28, -28 };
+ //offset to apply to get beginning of actors array
+ private int[] ActorStructSize = new [] { 160, 180, 182 };
+ //size of one actor
+ private int[] TrackModeOffsets = new [] { 82, 90, 90 };
+
+ private Vector3 lastPlayerPosition;
+ private int lastValidPlayerIndex;
+ private int linkfloor = 0;
+ private int linkroom = 0;
+ private long memoryAddress;
+ private byte[] memory;
+
+ //fps
+ private int oldFramesCount;
+ private Queue<int> previousFramesCount = new Queue<int>();
+ private Queue<float> previousFrameTime = new Queue<float>();
+
+ private float lastDelay;
+ private Timer delayCounter = new Timer();
+ private Timer totalDelay = new Timer();
+
+ private int inHand;
+ private bool allowInventory;
+ private bool saveTimerFlag;
+ private ushort internalTimer2;
+
+ public void Start()
+ {
+  //game has maximum 50 actors
+  for (int i = 0; i < 50; i++)
+  {
+   Box box = Instantiate(BoxPrefab);
+   box.transform.parent = Actors.transform;
+   box.name = "Actor";
+  }
+ }
+
+ public void UpdateAllActors()
+ {
+  Box player = null;
+  if (ProcessReader != null)
+  {
+   if (ProcessReader.Read(memory, memoryAddress, memory.Length) > 0)
+   {
+    //read actors info
+    int i = 0;
+    foreach (Box box in Actors.GetComponentsInChildren<Box>(true))
+    {
+     int k = i * ActorStructSize[dosBoxPattern];
+     int floorNumber = Utils.ReadShort(memory, k + 46);
+     int roomNumber = Utils.ReadShort(memory, k + 48);
+
+     int objectid = Utils.ReadShort(memory, k + 0);
+     int body = Utils.ReadShort(memory, k + 2);
+
+     int trackModeOffset = TrackModeOffsets[dosBoxPattern];
+     int trackMode = Utils.ReadShort(memory, k + trackModeOffset);
+     bool isActive = objectid != -1;
+
+     if (isActive)
+     {
+      //player
+      if (trackMode == 1 || objectid == lastValidPlayerIndex)
+      {
+       //update player index
+       lastValidPlayerIndex = objectid;
+
+       //automatically switch room and floor (has to be done before setting other actors positions)
+       if (linkfloor != floorNumber || linkroom != roomNumber)
+       {
+        linkfloor = floorNumber;
+        linkroom = roomNumber;
+
+        GetComponent<RoomLoader>().RefreshRooms(linkfloor, linkroom);
+       }
+      }
+
+      Transform roomObject = GetComponent<RoomLoader>().GetRoom(floorNumber, roomNumber);
+      if (roomObject != null)
+      {
+       //local position
+       int boundingX1 = Utils.ReadShort(memory, k + 8);
+       int boundingX2 = Utils.ReadShort(memory, k + 10);
+       int boundingY1 = Utils.ReadShort(memory, k + 12);
+       int boundingY2 = Utils.ReadShort(memory, k + 14);
+       int boundingZ1 = Utils.ReadShort(memory, k + 16);
+       int boundingZ2 = Utils.ReadShort(memory, k + 18);
+
+       int modx = 0, mody = 0, modz = 0;
+       if(dosBoxPattern == 0) //AITD1 only
+       {
+        modx = Utils.ReadShort(memory, k + 90);
+        mody = Utils.ReadShort(memory, k + 92);
+        modz = Utils.ReadShort(memory, k + 94);
+       }
+
+       FixBoundingWrap(ref boundingX1, ref boundingX2);
+       FixBoundingWrap(ref boundingY1, ref boundingY2);
+       FixBoundingWrap(ref boundingZ1, ref boundingZ2);
+
+       box.BoundingLower = new Vector3(boundingX1, boundingY1, boundingZ1);
+       box.BoundingUpper = new Vector3(boundingX2, boundingY2, boundingZ2);
+
+       //local to global position
+       Vector3 boxPosition = box.BoundingPos / 1000.0f;
+       boxPosition = new Vector3(boxPosition.x, -boxPosition.y, boxPosition.z) + roomObject.localPosition;
+
+       if (box.transform.position != boxPosition)
+       {
+        Vector3 offset = box.transform.position - boxPosition;
+        box.LastOffset = Mathf.FloorToInt(1000.0f * new Vector3(offset.x, 0.0f, offset.z).magnitude);
+        box.LastDistance += box.LastOffset;
+        box.transform.position = boxPosition;
+       }
+
+       //make actors appears slightly bigger than they are to be not covered by colliders
+       Vector3 delta = Vector3.one;
+       box.transform.localScale = (box.BoundingSize + delta) / 1000.0f;
+
+       //make sure very small actors are visible
+       box.transform.localScale = new Vector3(
+        Mathf.Max(box.transform.localScale.x, 0.1f),
+        Mathf.Max(box.transform.localScale.y, 0.1f),
+        Mathf.Max(box.transform.localScale.z, 0.1f));
+
+       box.ID = objectid;
+       box.Body = body;
+       box.Room = roomNumber;
+       box.Floor = floorNumber;
+       box.Flags = Utils.ReadShort(memory, k + 4);
+       box.ColFlags = Utils.ReadShort(memory, k + 6);
+       box.LifeMode =Utils. ReadShort(memory, k + 50);
+       box.Life = Utils.ReadShort(memory, k + 52);
+       box.Chrono = Utils.ReadUnsignedInt(memory, k + 54);
+       box.RoomChrono = Utils.ReadUnsignedInt(memory, k + 58);
+       box.AnimType = Utils.ReadShort(memory, k + 64);
+       box.NextAnim = Utils.ReadShort(memory, k + 66);
+       box.TotalFrames = Utils.ReadShort(memory, k + 76);
+       box.TrackNumber = Utils.ReadShort(memory, k + 84);
+       box.PositionInTrack = Utils.ReadShort(memory, k + 88);
+       box.TrackMode = trackMode;
+       box.Speed = Utils.ReadShort(memory, k + 116);
+       box.Slot = i;
+
+       box.Angles.x = Utils.ReadShort(memory, k + 40);
+       box.Angles.y = Utils.ReadShort(memory, k + 42);
+       box.Angles.z = Utils.ReadShort(memory, k + 44);
+
+       box.LocalPosition.x = Utils.ReadShort(memory, k + 28) + modx;
+       box.LocalPosition.y = Utils.ReadShort(memory, k + 30) + mody;
+       box.LocalPosition.z = Utils.ReadShort(memory, k + 32) + modz;
+
+       box.WorldPosition.x = Utils.ReadShort(memory, k + 34) + modx;
+       box.WorldPosition.y = Utils.ReadShort(memory, k + 36) + mody;
+       box.WorldPosition.z = Utils.ReadShort(memory, k + 38) + modz;
+       box.ShowAdditionalInfo = ShowAdditionalInfo;
+
+       bool isAITD1 = dosBoxPattern == 0;
+       if (isAITD1)
+       {
+        //hot point
+        int animationType = Utils.ReadShort(memory, k + 142);
+        Box hotPoint = box.HotPoint;
+
+        if (animationType == 2)
+        {
+         if (hotPoint == null)
+         { 
+          hotPoint = Instantiate(BoxPrefab);
+          hotPoint.name = "HotPoint";
+          hotPoint.Color = new Color32(255, 0, 0, 255);
+          box.HotPoint = hotPoint;
+         }
+
+         Vector3 hotPosition;
+         hotPosition.x = Utils.ReadShort(memory, k + 154);
+         hotPosition.y = Utils.ReadShort(memory, k + 156);
+         hotPosition.z = Utils.ReadShort(memory, k + 158);
+         
+         Vector3 finalPos = (hotPosition + box.LocalPosition) / 1000.0f;
+         finalPos = new Vector3(finalPos.x, -finalPos.y, finalPos.z) + roomObject.localPosition;
+         hotPoint.transform.position = finalPos;
+
+         float range = Utils.ReadShort(memory, k + 148);
+         hotPoint.transform.localScale = new Vector3(range, range, range) / 500.0f;
+        }
+        else if (hotPoint != null)
+        {
+         Destroy(hotPoint.gameObject);
+         box.HotPoint = null;
+        }
+       }
+
+       int anim = Utils.ReadShort(memory, k + 62);
+       int keyframe = Utils.ReadShort(memory, k + 74);
+
+       if (ShowAdditionalInfo)
+       {
+        int endframe = Utils.ReadShort(memory, k + 78);
+        int endanim = Utils.ReadShort(memory, k + 80);
+
+        if(anim != box.Anim || keyframe != box.Keyframe || endframe == 1 || endanim == 1)
+        {
+         box.lastKeyFrameChange.Reset();
+        }
+
+        if (saveTimerFlag)
+        {
+         box.lastKeyFrameChange.Stop();
+        }
+        else
+        {
+         box.lastKeyFrameChange.Start();
+        }
+       }
+
+       box.Anim = anim;
+       box.Keyframe = keyframe;
+
+       //player
+       if (objectid == lastValidPlayerIndex)
+       {
+        //check if player has moved
+        if (box.transform.position != lastPlayerPosition)
+        {
+         //center camera to player position
+         GetComponent<RoomLoader>().CenterCamera(new Vector2(box.transform.position.x, box.transform.position.z));
+         lastPlayerPosition = box.transform.position;
+        }
+
+        //follow player
+        Arrow.transform.position = box.transform.position + new Vector3(0.0f, box.transform.localScale.y / 2.0f + 0.001f, 0.0f);
+
+        //face camera
+        float angle = box.Angles.y * 360.0f / 1024.0f;
+        Arrow.transform.rotation = Quaternion.AngleAxis(90.0f, -Vector3.left);
+        Arrow.transform.rotation *= Quaternion.AngleAxis((angle + 180.0f) % 360.0f, Vector3.forward);
+
+        float minBoxScale = Mathf.Min(box.transform.localScale.x, box.transform.localScale.z);
+        Arrow.transform.localScale = new Vector3(
+         minBoxScale * 0.9f,
+         minBoxScale * 0.9f,
+         1.0f);
+
+        //player is white
+        box.Color = new Color32(255, 255, 255, 255);
+        box.AlwaysOnTop = Camera.main.orthographic;
+        Arrow.AlwaysOnTop = Camera.main.orthographic;
+        player = box;
+       }
+       else
+       {
+        //other actors are green
+        box.Color = new Color32(0, 128, 0, 255);
+       }
+
+       box.gameObject.SetActive(true);
+      }
+      else
+      {
+       box.gameObject.SetActive(false);
+      }
+     }
+     else
+     {
+      box.gameObject.SetActive(false);
+     }
+
+     i++;
+    }
+
+    if (ShowAdditionalInfo)
+    {
+     //internal timer
+     ProcessReader.Read(memory, memoryAddress - 0x83B6 - 6, 4);
+     InternalTimer = Utils.ReadUnsignedInt(memory, 0);
+
+     //internal timer 2
+     ProcessReader.Read(memory, memoryAddress - 0x83B6 - 6 + 0xA5CE, 2);
+     internalTimer2 = Utils.ReadUnsignedShort(memory, 0);
+
+     //inventory
+     ProcessReader.Read(memory, memoryAddress - 0x83B6 - 6 - 0x1A4, 2);
+     allowInventory = Utils.ReadShort(memory, 0) == 1;
+
+     //inhand
+     ProcessReader.Read(memory, memoryAddress - 0x83B6 + 0xA33C, 2);
+     inHand = Utils.ReadShort(memory, 0);
+
+     ProcessReader.Read(memory, memoryAddress - 0x83B6 - 6 + 0x13EA, 4);
+     saveTimerFlag = memory[0] == 1;
+    }
+   }
+   else
+   {
+    //unlink DOSBOX
+    GetComponent<RoomLoader>().ProcessKey(KeyCode.L);
+   }
+  }
+
+  //arrow is only active if actors are active and player is active
+  Arrow.gameObject.SetActive(Actors.activeSelf
+   && player != null
+   && player.gameObject.activeSelf
+   && player.transform.localScale.magnitude > 0.01f);
+  Player = player;
+ }
+
+ public void UpdateBoxInfo()
+ {
+  BoxInfo.Clear();
+  if (Player != null)
+  {
+   float angle = Player.Angles.y * 360.0f / 1024.0f;
+   float sideAngle = (angle + 45.0f) % 90.0f - 45.0f;
+
+   BoxInfo.Append("Position", Player.LocalPosition);
+   BoxInfo.Append("Angle", "{0:N1} {1:N1}", angle, sideAngle);
+  }
+
+  if (ShowAdditionalInfo)
+  {
+   if(Player != null) BoxInfo.Append();
+
+   int calculatedFps = previousFramesCount.Sum();
+   
+   Vector3 mousePosition = GetMousePosition(linkroom, linkfloor);
+   TimeSpan totalDelayTS = TimeSpan.FromSeconds(totalDelay.Elapsed);
+
+   BoxInfo.Append("Timer 1", TimeSpan.FromSeconds(InternalTimer / 60));
+   BoxInfo.Append("Timer 2", TimeSpan.FromSeconds(internalTimer2 / 60));
+   BoxInfo.Append("FPS/Delay", "{0}; {1} ms", calculatedFps, Mathf.FloorToInt(lastDelay * 1000));
+   BoxInfo.Append("Total delay", "{0:D2}:{1:D2}:{2:D2}.{3:D3} ", totalDelayTS.Hours, totalDelayTS.Minutes, totalDelayTS.Seconds, totalDelayTS.Milliseconds);
+   BoxInfo.Append("Cursor position", "{0} {1}", Mathf.Clamp((int)(mousePosition.x), -32768, 32767), Mathf.Clamp((int)(mousePosition.z), -32768, 32767));
+   if(Player != null) BoxInfo.Append("Last offset/dist", "{0}; {1}", Player.LastOffset, Player.LastDistance);
+   BoxInfo.Append("Allow inventory", allowInventory ? "Yes" : "No");
+   BoxInfo.Append("In hand", inHand);
+  }
+
+  BoxInfo.UpdateText();
+ }
+
+ public void Update()
+ {
+  if (Input.GetKeyDown(KeyCode.Q))
+  {
+   totalDelay.Reset();
+  }
+  if (Input.GetKeyDown(KeyCode.W))
+  {
+   foreach (Box box in Actors.GetComponentsInChildren<Box>(true))
+   {
+    box.LastDistance = 0;
+   }
+  }
+  if (Input.GetKeyDown(KeyCode.Alpha1) && ProcessReader != null)
+  {
+   //internal timer 1
+   InternalTimer -= 60 * 5; //back 5 frames
+   Utils.Write(InternalTimer, memory, 0);
+   ProcessReader.Write(memory, memoryAddress - 0x83B6 - 6, 4);
+  }
+  if (Input.GetKeyDown(KeyCode.Alpha2) && ProcessReader != null)
+  {
+   //internal timer 2
+   internalTimer2 -= 60 * 5; //back 5 frames
+   Utils.Write(internalTimer2, memory, 0);
+   ProcessReader.Write(memory, memoryAddress - 0x83B6 - 6 + 0xA5CE, 2);
+  }
+ }
+
+ public void CalculateFPS()
+ {
+  if (ProcessReader != null && ShowAdditionalInfo)
+  {
+   //fps
+   ProcessReader.Read(memory, memoryAddress - 0x83B6, 2);
+   int fps = Utils.ReadShort(memory, 0);
+
+   //frames counter (reset to zero when every second by AITD)
+   ProcessReader.Read(memory, memoryAddress - 0x83B6 + 0x7464, 2);
+   int frames = Utils.ReadShort(memory, 0);
+
+   //check how much frames elapsed since last time
+   int diff;
+   if (frames >= oldFramesCount)
+    diff = frames - oldFramesCount; //eg: 15 - 20
+   else
+    diff = fps - oldFramesCount + frames; //special case: eg: 60 - 58 + 3
+   oldFramesCount = frames;
+
+   //check for large delays
+   if (!saveTimerFlag)
+   {
+    delayCounter.Reset();
+    totalDelay.Stop();
+   }
+   else
+   { 
+    delayCounter.Start();
+    totalDelay.Start();
+
+    if(delayCounter.Elapsed >= 0.1f) //100ms
+    {
+     lastDelay = delayCounter.Elapsed;
+    }
+   }
+
+   float time = Time.time;
+   if (diff > 0)
+   {
+    previousFramesCount.Enqueue(diff);
+    previousFrameTime.Enqueue(time);
+   }
+
+   //remove any frame info older than one second
+   while (previousFrameTime.Count > 0 && 
+    previousFrameTime.Peek() < (time - 1.0f))
+   {
+    previousFramesCount.Dequeue();
+    previousFrameTime.Dequeue();
+   }
+  }  
+ }
+
+ void FixBoundingWrap(ref int a, ref int b)
+ {
+  if(a > b)
+  {
+   if((Int16.MaxValue - a) > (b - Int16.MinValue))
+   {
+    b += 65536;
+   }
+   else
+   {
+    a -= 65536;
+   }
+  }
+ }
+
+ #region Room loader
+
+ public bool LinkToDosBOX(int floor, int room)
+ {
+  int[] processIds = Process.GetProcesses()
+  .Where(x =>
+   {
+    string name;
+    try
+    {
+     name = x.ProcessName;
+    }
+    catch
+    {
+     name = string.Empty;
+    }
+    return name.StartsWith("DOSBOX", StringComparison.InvariantCultureIgnoreCase);
+   })
+  .Select(x => x.Id)
+  .ToArray();
+
+  if (!processIds.Any())
+  {
+   RightText.text = "Cannot find DOSBOX process";
+   return false;
+  }
+
+  //search player position in DOSBOX processes
+  int detectedGame = GetComponent<RoomLoader>().DetectGame();
+  int patternIndex = detectedGame - 1;
+  foreach (int processId in processIds)
+  {
+   ProcessMemoryReader reader = new ProcessMemoryReader(processId);
+   foreach (var pattern in PlayerInitialPosition[patternIndex])
+   {
+    long address = reader.SearchForBytePattern(pattern);
+    if (address != -1)
+    {
+     //force reload
+     linkfloor = floor;
+     linkroom = room;
+
+     memoryAddress = address + MemoryOffsets[patternIndex];
+     ProcessReader = reader;
+     memory = new byte[ActorStructSize[patternIndex] * 50];
+     dosBoxPattern = patternIndex;
+
+     //check if CDROM/floppy version (AITD1 only)    
+     byte[] cdPattern = ASCIIEncoding.ASCII.GetBytes("CD Not Found");
+     GetComponent<RoomLoader>().IsCDROMVersion = 
+      detectedGame == 1 && reader.SearchForBytePattern(cdPattern) != -1;
+
+     //vars
+     if (patternIndex == 0) //AITD1 only
+     {
+      GetComponent<Vars>().SearchForPatterns(reader);
+     }
+     RightText.text = string.Empty;
+     return true;
+    }
+   }
+
+   reader.Close();
+  }
+
+  RightText.text = "Cannot find player data in DOSBOX process memory.";
+  return false;
+ }
+
+ public void UnlinkDosBox()
+ {
+  ProcessReader.Close();
+  ProcessReader = null;
+  BoxInfo.Clear(true);
+  RightText.text = string.Empty;
+ }
+
+ public void ResetCamera(int floor, int room)
+ {
+  lastPlayerPosition = Vector3.zero;
+  linkfloor = floor;
+  linkroom = room;
+ }
+
+ public long GetActorMemoryAddress(int index)
+ {
+  return memoryAddress + index * ActorStructSize[dosBoxPattern];
+ }
+
+ public Vector3 GetMousePosition(int room, int floor)
+ {
+  Vector3 cameraHeight = new Vector3(0.0f, 0.0f, Camera.main.transform.position.y);
+  Vector3 mousePosition = Camera.main.ScreenToWorldPoint(Input.mousePosition + cameraHeight);
+  Transform roomObject = GetComponent<RoomLoader>().GetRoom(floor, room);
+  if (roomObject != null)
+  {
+   mousePosition -= roomObject.position;
+  }
+  return mousePosition * 1000.0f;
+ }
+
+ #endregion
+}
+using UnityEngine;
+using System.Collections;
+using System.Runtime.InteropServices;
+using System;
+using System.Diagnostics;
+using System.Linq;
+
+public class ProcessMemoryReader
+{
+ const int PROCESS_QUERY_INFORMATION = 0x0400;
+ const int PROCESS_VM_READ = 0x0010;
+ const int PROCESS_VM_WRITE = 0x0020;
+ const int PROCESS_VM_OPERATION = 0x0008;
+ const int MEM_COMMIT = 0x00001000;
+ const int MEM_PRIVATE = 0x20000;
+ const int PAGE_READWRITE = 0x04;
+
+ [StructLayout(LayoutKind.Sequential)]
+ private struct MEMORY_BASIC_INFORMATION
+ {
+  public IntPtr BaseAddress;
+  public IntPtr AllocationBase;
+  public uint AllocationProtect;
+  public IntPtr RegionSize;
+  public int State;
+  public int Protect;
+  public int Type;
+ }
+
+ [DllImport("kernel32.dll")]
+ private static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+ [DllImport("kernel32.dll")]
+ private static extern bool CloseHandle(IntPtr hObject);
+
+ [DllImport("kernel32.dll")]
+ private static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesRead);
+
+ [DllImport("kernel32.dll")]
+ private static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesWritten);
+
+ [DllImport("kernel32.dll")]
+ private static extern int VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, uint dwLength);
+
+ private IntPtr processHandle;
+
+ public ProcessMemoryReader(int processId)
+ {
+  this.processHandle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, false, processId);
+ }
+
+ ~ProcessMemoryReader()
+ {
+  Close();
+ }
+
+ public long Read(byte[] buffer, long offset, int count)
+ {
+  IntPtr bytesRead;
+  if (ReadProcessMemory(processHandle, new IntPtr(offset), buffer, count, out bytesRead))
+  {
+   return (long)bytesRead;
+  }
+  return 0;
+ }
+
+ public long Write(byte[] buffer, long offset, int count)
+ {
+  IntPtr bytesWritten;
+  if (WriteProcessMemory(processHandle, new IntPtr(offset), buffer, count, out bytesWritten))
+  {
+   return (long)bytesWritten;
+  }
+  return 0;
+ }
+
+ public void Close()
+ {
+  if (processHandle != IntPtr.Zero)
+  {
+   CloseHandle(processHandle);
+   processHandle = IntPtr.Zero;
+  }
+ }
+
+ public long SearchForBytePattern(byte[] pattern)
+ {
+  MEMORY_BASIC_INFORMATION mem_info = new MEMORY_BASIC_INFORMATION();
+
+  long min_address = 0;
+  long max_address = 0x7FFFFFFF;
+  byte[] buffer = new byte[81920];
+
+  //scan process memory regions
+  while (min_address < max_address
+   && VirtualQueryEx(processHandle, (IntPtr)min_address, out mem_info, (uint)Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION))) > 0)
+  {
+   //check if memory region is accessible
+   //skip regions smaller than 16M (default DOSBOX memory size)
+   if (mem_info.Protect == PAGE_READWRITE && mem_info.State == MEM_COMMIT && (mem_info.Type & MEM_PRIVATE) == MEM_PRIVATE
+    && (int)mem_info.RegionSize >= 1024 * 1024 * 16)
+   {
+    long readPosition = (long)mem_info.BaseAddress;
+    int bytesToRead = (int)mem_info.RegionSize;
+
+    long bytesRead;
+    while (bytesToRead > 0 && (bytesRead = Read(buffer, readPosition, Math.Min(buffer.Length, bytesToRead))) > 0)
+    {
+     //search bytes pattern
+     int index = IndexOf(buffer, pattern, (int)bytesRead);
+     if (index != -1)
+     {
+      return readPosition + index;
+     }
+
+     readPosition += bytesRead;
+     bytesToRead -= (int)bytesRead;
+    }
+   }
+
+   // move to next memory region
+   min_address = (long)mem_info.BaseAddress + (long)mem_info.RegionSize;
+  }
+
+  return -1;
+ }
+
+ private int IndexOf(byte[] x, byte[] y, int count)
+ {
+  for (int i = 0; i < count - y.Length + 1; i++)
+   if (IsMatch(x, y, i))
+    return i;
+  return -1;
+ }
+
+ private bool IsMatch(byte[] x, byte[] y, int index)
+ {
+  for (int j = 0; j < y.Length; j++)
+   if (x[j + index] != y[j])
+    return false;
+  return true;
+ }
+}
+using System;
+using UnityEngine;
+using UnityEngine.UI;
+using System.IO;
+using UnityEngine.EventSystems;
+
+public class Vars : MonoBehaviour
+{
+ private bool pauseVarsTracking;
+
+ private byte[] memory = new byte[512];
+ private Var[] vars = new Var[207];
+ private Var[] cvars = new Var[44];
+ private VarParser varParser = new VarParser();
+
+ private byte[] varsMemoryPattern = new byte[] { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2E, 0x00, 0x2F, 0x00, 0x00, 0x00, 0x00 };
+ private long varsMemoryAddress = -1;
+
+ private byte[] cvarsMemoryPattern = new byte[] { 0x31, 0x00, 0x0E, 0x01, 0xBC, 0x02, 0x12, 0x00, 0x06, 0x00, 0x13, 0x00, 0x14, 0x00, 0x01 };
+ private long cvarsMemoryAddress = -1;
+
+ private bool compare;
+ private bool oldcompare;
+ private bool ignoreDifferences;
+
+ public RectTransform Panel;
+ public RectTransform TabA;
+ public RectTransform TabB;
+ public RectTransform TableHeaderPrefab;
+ public InputField TableCellPrefab;
+ public RectTransform ToolTip;
+
+ public Vars()
+ {
+  InitVars(vars);
+  InitVars(cvars);
+ }
+
+ public void Start()
+ {
+  //parse vars.txt file
+  string varPath = @"GAMEDATA\vars.txt";
+  if (File.Exists(varPath))
+  {
+   varParser.Parse(varPath);
+  }
+ }
+
+ void InitVars(Var[] data)
+ {
+  for(int i = 0 ; i < data.Length ; i++)
+  {
+   data[i] = new Var();
+  }
+ }
+
+ public void OnEnable()
+ {
+  ignoreDifferences = !compare;
+  BuildTables();
+  UpdateCellSize();
+  Panel.gameObject.SetActive(true);
+ }
+
+ public void OnDisable()
+ {
+  if(Panel != null)
+   Panel.gameObject.SetActive(false);
+  if(ToolTip != null)
+   ToolTip.gameObject.SetActive(false);
+ }
+
+ void Update()
+ {
+  ProcessMemoryReader processReader = GetComponent<DosBox>().ProcessReader;
+  if (processReader != null)
+  {
+   if (!pauseVarsTracking)
+   {
+    if (varsMemoryAddress != -1)
+    {
+     processReader.Read(memory, varsMemoryAddress, 207 * 2);
+     CheckDifferences(memory, vars, varsMemoryAddress);
+    }
+
+    if (cvarsMemoryAddress != -1)
+    {
+     processReader.Read(memory, cvarsMemoryAddress, 44 * 2);
+     CheckDifferences(memory, cvars, cvarsMemoryAddress);
+    }
+
+    ignoreDifferences = false;
+   }
+  }
+
+  //hide table
+  if (Input.GetMouseButtonDown(1))
+  {
+   this.enabled = false;
+  }
+
+  UpdateCellSize();
+ }
+
+ void UpdateCellSize()
+ {
+  //set cell size
+  Vector2 cellSize = new Vector2(Screen.width / 21.0f, (Screen.height - 30.0f) / 16.0f);
+  TabA.GetComponent<GridLayoutGroup>().cellSize = cellSize;
+  TabB.GetComponent<GridLayoutGroup>().cellSize = cellSize;
+ }
+
+ void BuildTables()
+ {
+  BuildTable(TabA, "VARS", vars);
+  BuildTable(TabB, "C_VARS", cvars);
+ }
+
+ void BuildTable(RectTransform tab, string sectionName, Var[] data)
+ {
+  if (tab.childCount == 0)
+  {
+   //empty
+   GameObject empty = new GameObject(string.Empty, typeof(RectTransform));
+   empty.AddComponent<Image>().color = TableHeaderPrefab.GetComponent<Image>().color;
+   empty.transform.SetParent(tab.transform);
+
+   for (int i = 0; i < 20; i++)
+   {
+    RectTransform header = Instantiate(TableHeaderPrefab);
+    header.transform.SetParent(tab.transform);
+    header.GetComponentInChildren<Text>().text = i.ToString();
+   }
+
+   for (int i = 0; i < data.Length; i++)
+   {
+    if (i % 20 == 0)
+    {
+     RectTransform header = Instantiate(TableHeaderPrefab);
+     header.transform.SetParent(tab.transform);
+     Text textComponent = header.GetComponentInChildren<Text>();
+     textComponent.GetComponentInChildren<RectTransform>().offsetMax = new Vector2(-5, 0);
+     textComponent.alignment = TextAnchor.MiddleRight;
+     textComponent.text = i.ToString();
+    }
+
+    InputField cell = Instantiate(TableCellPrefab);
+    cell.transform.SetParent(tab.transform);
+
+    Var var = data[i];
+    cell.onEndEdit.AddListener((value) => OnCellChange(cell, var));
+
+    int cellIndex = i;
+    UIPointerHandler pointerHandler = cell.GetComponent<UIPointerHandler>();
+    pointerHandler.PointerEnter.AddListener((value) => OnCellPointerEnter(cell, sectionName, cellIndex));
+    pointerHandler.PointerExit.AddListener((value) => OnCellPointerExit());
+    var.inputField = cell;
+   }
+  }
+ }
+
+ void SaveState(Var[] data)
+ {
+  foreach(Var var in data)
+  {
+   var.saveState = var.value;
+  }
+ }
+
+ void CheckDifferences(byte[] memory, Var[] data, long offset)
+ {
+  float currenttime = Time.time;
+  for (int i = 0; i < data.Length; i++)
+  {
+   Var var = data[i];
+   int oldValue = var.value;
+   int value;
+
+   if (compare)
+   {
+    value = var.saveState;
+   }
+   else
+   {
+    value = Utils.ReadShort(memory, i * 2 + 0);
+   }
+
+   var.value = value;
+
+   if (ignoreDifferences)
+   {
+    var.time = float.MinValue;
+   }
+   else if (value != oldValue)
+   {
+    if (compare)
+    {
+     var.time = float.MaxValue;
+    }
+    else
+    {
+     var.time = currenttime;
+    }
+   }
+
+   var.memoryAddress = offset + i * 2;
+
+   //Check differences
+   bool difference = (currenttime - var.time) < 5.0f;
+
+   InputField inputField = var.inputField;
+
+   string newText = string.Empty;
+   if (value != 0 || difference)
+   {
+    newText = value.ToString();
+   }
+
+   if (inputField.text != newText && !inputField.isFocused)
+   {
+    inputField.text = newText;
+   }
+
+   if (difference)
+   {
+    SetInputFieldColor(inputField, new Color32(240, 68, 77, 255));
+   }
+   else
+   {
+    SetInputFieldColor(inputField, new Color32(47, 47, 47, 255));
+   }
+  }
+ }
+
+ void OnCellPointerEnter(InputField cell, string sectionName, int cellIndex)
+ {
+  string text = "#" + cellIndex;
+  string description = varParser.GetText(sectionName, cellIndex);
+  if(!string.IsNullOrEmpty(description))
+  {
+   text += "\r\n" + description;
+  }
+
+  ToolTip.GetComponentInChildren<Text>().text = text;
+  RectTransform cellTransform = cell.GetComponent<RectTransform>();
+  RectTransform toolTipTransform = ToolTip.GetComponent<RectTransform>();
+  Vector2 toolTipSize = toolTipTransform.sizeDelta;
+
+  toolTipTransform.position = MoveToolTipIfNeeded(cellTransform.position
+   - new Vector3(0.0f, cellTransform.sizeDelta.y / 2.0f, 0.0f),
+   toolTipSize.x / 2.0f,
+   Screen.width - toolTipSize.x / 2.0f);
+
+  ToolTip.gameObject.SetActive(true);
+ }
+
+ Vector3 MoveToolTipIfNeeded(Vector3 position, float min, float max)
+ {
+  return new Vector3(Mathf.Clamp(position.x, min, max), position.y, position.z);
+ }
+
+ void OnCellPointerExit()
+ {
+  ToolTip.gameObject.SetActive(false);
+ }
+
+ void OnCellChange(InputField cell, Var var)
+ {
+  int newValueInt;
+  if (int.TryParse(cell.text, out newValueInt) || cell.text == string.Empty)
+  {
+   if (newValueInt > short.MaxValue) newValueInt = short.MaxValue;
+   if (newValueInt < short.MinValue) newValueInt = short.MinValue;
+
+   if (newValueInt != var.value)
+   {
+    //write new value to memory
+    ProcessMemoryReader processReader = GetComponent<DosBox>().ProcessReader;
+    byte[] wordValue = new byte[2];
+    Utils.Write((short)newValueInt, wordValue, 0);
+    processReader.Write(wordValue, var.memoryAddress, wordValue.Length);
+   }
+  }
+ }
+
+ public void FreezeClick(Button button)
+ {
+  pauseVarsTracking = !pauseVarsTracking;
+  ToggleButtonState(button, pauseVarsTracking);
+ }
+
+ private void SetInputFieldColor(InputField inputField, Color32 color)
+ {
+  var colors = inputField.colors;
+  colors.normalColor = color;
+  inputField.colors = colors;
+ }
+
+ private void SetButtonColor(Button button, Color32 normalColor, Color32 highlightedColor)
+ {
+  var colors = button.colors;
+  colors.normalColor = normalColor;
+  colors.highlightedColor = highlightedColor;
+  button.colors = colors;
+ }
+
+ public void ToggleButtonState(Button button, bool enabled)
+ {
+  Text text = button.GetComponentInChildren<Text>();
+  text.color = enabled ? Color.red : (Color)new Color32(50, 50, 50, 255);
+  SetButtonColor(button, enabled ? new Color32(255, 174, 174, 255) : new Color32(43, 193, 118, 255), enabled ? new Color32(255, 174, 174, 255) : new Color32(178, 255, 207, 255));
+ }
+
+ public void SaveStateClick()
+ {
+  SaveState(vars);
+  SaveState(cvars);
+ }
+
+ public void CompareClick(Button button)
+ {
+  compare = !compare;
+
+  if (!compare && oldcompare)
+  {
+   ignoreDifferences = true;
+  }
+  oldcompare = compare;
+  ToggleButtonState(button, compare);
+ }
+
+
+ public void SearchForPatterns(ProcessMemoryReader reader)
+ {
+  varsMemoryAddress = reader.SearchForBytePattern(varsMemoryPattern);
+  cvarsMemoryAddress = reader.SearchForBytePattern(cvarsMemoryPattern);
+ }
+
+ public class Var
+ {
+  public int value;
+  public int saveState; //value set there when using SaveState button
+  public float time; //time since last difference
+  public long memoryAddress;
+  public InputField inputField;
+ }
+}
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+using System;
+using System.Linq;
+
+public class WarpDialog : MonoBehaviour
+{
+ public GameObject Actors;
+ public bool warpMenuEnabled;
+ public Box warpActor;
+ public InputField positionX, positionY, positionZ;
+ public InputField localPosX, localPosY, localPosZ;
+ public InputField worldPosX, worldPosY, worldPosZ;
+ public InputField boundingPosX, boundingPosY, boundingPosZ;
+ public RectTransform Panel;
+
+ public InputField angle;
+ public ToggleButton AdvancedMode;
+
+ private float lastTimeKeyPressed;
+
+ void Start ()
+ {
+  ToggleAdvanceMode(false);
+ }
+
+ void Update ()
+ {
+  if (Input.GetMouseButtonUp(0)
+   && !RectTransformUtility.RectangleContainsScreenPoint(Panel, Input.mousePosition))
+  {
+   warpMenuEnabled = false;
+  }
+
+  Panel.gameObject.SetActive(warpMenuEnabled);
+
+  if(warpActor != null && GetComponent<DosBox>().ProcessReader != null)
+  {
+   if(!Panel.GetComponentsInChildren<InputField>().Any(x => x.isFocused))
+   {
+    bool enoughTimeElapsed = (Time.time - lastTimeKeyPressed) > 0.1f;
+    if (enoughTimeElapsed)
+    {
+     if (Input.GetKey(KeyCode.Keypad9))
+     {
+      RotateActor(-1);
+     }
+
+     if (Input.GetKey(KeyCode.Keypad7))
+     {
+      RotateActor(1);
+     }
+
+     if (Input.GetKey(KeyCode.Keypad4))
+     {
+      MoveActor(new Vector3(-1.0f, 0.0f, 0.0f));
+     }
+
+     if (Input.GetKey(KeyCode.Keypad6))
+     {
+      MoveActor(new Vector3(1.0f, 0.0f, 0.0f));
+     }
+
+     if (Input.GetKey(KeyCode.Keypad2))
+     {
+      MoveActor(new Vector3(0.0f, 0.0f, -1.0f));
+     }
+
+     if (Input.GetKey(KeyCode.Keypad8))
+     {
+      MoveActor(new Vector3(0.0f, 0.0f, 1.0f));
+     }
+    }
+
+    if (Input.GetKeyUp(KeyCode.Keypad4) ||
+     Input.GetKeyUp(KeyCode.Keypad8) ||
+     Input.GetKeyUp(KeyCode.Keypad6) ||
+     Input.GetKeyUp(KeyCode.Keypad2) ||
+     Input.GetKeyUp(KeyCode.Keypad7) ||
+     Input.GetKeyUp(KeyCode.Keypad9) ||
+     Input.GetKey(KeyCode.Keypad0))
+    {
+     lastTimeKeyPressed = 0.0f;
+    }
+   }
+  }
+
+  //warp to mouse position
+  if ((Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)) && Input.GetKeyDown(KeyCode.W))
+  {
+   if (GetComponent<DosBox>().ProcessReader != null)
+   {
+    //select player by default
+    if (warpActor == null)
+    {
+     warpActor = GetComponent<DosBox>().Player;
+    }
+
+    Vector3 offset = GetComponent<DosBox>().GetMousePosition(warpActor.Room, warpActor.Floor) - warpActor.LocalPosition;
+    offset = new Vector3(Mathf.RoundToInt(offset.x), 0.0f, Mathf.RoundToInt(offset.z));
+    MoveActor(offset);
+   }
+  }
+ }
+
+ public void LoadActor(Box actor)
+ {
+  UpdateAngleInputField(actor);
+  UpdatePositionInputFields(actor);
+  warpActor = actor;
+ }
+
+ public void SetPositionClick()
+ {
+  //parse angle
+  int angleInt;
+  TryParseAngle(angle, out angleInt, (int)warpActor.Angles.y);
+  WriteActorAngle(warpActor, angleInt);
+  UpdateAngleInputField(warpActor);
+
+  //parse position
+  Vector3 lowerBound, upperBound, local, world;
+
+  if (!AdvancedMode.BoolValue)
+  {
+   TryParsePosition(positionX, positionY, positionZ, out local, warpActor.LocalPosition);
+
+   //apply offset to world/bound
+   Vector3 offset = local - warpActor.LocalPosition;
+   world = warpActor.WorldPosition + offset;
+   lowerBound = warpActor.BoundingLower + offset;
+   upperBound = warpActor.BoundingUpper + offset;
+  }
+  else
+  {
+   Vector3 boundingPos;
+   TryParsePosition(boundingPosX, boundingPosY, boundingPosZ, out boundingPos, warpActor.BoundingPos);
+   TryParsePosition(localPosX, localPosY, localPosZ, out local, warpActor.LocalPosition);
+   TryParsePosition(worldPosX, worldPosY, worldPosZ, out world, warpActor.WorldPosition);
+
+   Vector3 offset = boundingPos - warpActor.BoundingPos;
+   lowerBound = warpActor.BoundingLower + offset;
+   upperBound = warpActor.BoundingUpper + offset;
+  }
+
+  WriteActorPosition(warpActor, lowerBound, upperBound, local, world);
+  UpdatePositionInputFields(warpActor);
+ }
+
+ public void AdvancedModeClick()
+ {
+  AdvancedMode.BoolValue = !AdvancedMode.BoolValue;
+  ToggleAdvanceMode(AdvancedMode.BoolValue);
+ }
+
+ public void ToggleAdvanceMode(bool enabled)
+ {
+  positionX.transform.parent.parent.gameObject.SetActive(!enabled);
+  localPosX.transform.parent.parent.gameObject.SetActive(enabled);
+  worldPosX.transform.parent.parent.gameObject.SetActive(enabled);
+  boundingPosX.transform.parent.parent.gameObject.SetActive(enabled);
+  Panel.sizeDelta = new Vector2(Panel.sizeDelta.x, Panel.Cast<Transform>().Count(x => x.gameObject.activeSelf) * 30.0f);
+ }
+
+ //input keys
+ void RotateActor(int offset)
+ {
+  int angle = (int)warpActor.Angles.y + offset;
+  WriteActorAngle(warpActor, (angle + 1024) % 1024);
+  UpdateAngleInputField(warpActor);
+  lastTimeKeyPressed = Time.time;
+ }
+
+ //input keys
+ void MoveActor(Vector3 offset)
+ {
+  Vector3 local = warpActor.LocalPosition + offset;
+  Vector3 world = warpActor.WorldPosition + offset;
+  Vector3 boundLow = warpActor.BoundingLower + offset;
+  Vector3 boundUpper = warpActor.BoundingUpper + offset;
+
+  WriteActorPosition(warpActor, boundLow, boundUpper, local, world);
+  UpdatePositionInputFields(warpActor);
+  lastTimeKeyPressed = Time.time;
+ }
+
+ void UpdatePositionInputFields(Box actor)
+ {
+  boundingPosX.text = actor.BoundingPos.x.ToString();
+  boundingPosY.text = actor.BoundingPos.y.ToString();
+  boundingPosZ.text = actor.BoundingPos.z.ToString();
+  localPosX.text = positionX.text = actor.LocalPosition.x.ToString();
+  localPosY.text = positionY.text = actor.LocalPosition.y.ToString();
+  localPosZ.text = positionZ.text = actor.LocalPosition.z.ToString();
+  worldPosX.text = actor.WorldPosition.x.ToString();
+  worldPosY.text = actor.WorldPosition.y.ToString();
+  worldPosZ.text = actor.WorldPosition.z.ToString();
+ }
+
+ void UpdateAngleInputField(Box actor)
+ {
+  angle.text = (actor.Angles.y * 360.0f / 1024.0f).ToString("N1");
+ }
+
+ private void TryParseAngle(InputField inputField, out int intValue, int defaultValue)
+ {
+  float floatValue;
+  if(float.TryParse(inputField.text, out floatValue))
+  {
+   floatValue = floatValue >= 0.0f ? floatValue % 360.0f : 360.0f - ((-floatValue) % 360.0f);
+   intValue = Mathf.RoundToInt((floatValue * 1024.0f) / 360.0f);
+  }
+  else
+  {
+   intValue = defaultValue;
+  }
+ }
+
+ private void TryParsePosition(InputField posX, InputField posY, InputField posZ, out Vector3 intValue, Vector3 defaultValue)
+ {
+  int x, y, z;
+  TryParsePosition(posX, out x, (int)defaultValue.x);
+  TryParsePosition(posY, out y, (int)defaultValue.y);
+  TryParsePosition(posZ, out z, (int)defaultValue.z);
+
+  intValue = new Vector3(x, y, z);
+ }
+
+ private void TryParsePosition(InputField inputField, out int intValue, int defaultValue)
+ {
+  if(int.TryParse(inputField.text, out intValue))
+  {
+   intValue = Mathf.Clamp(intValue, short.MinValue, short.MaxValue);
+  }
+  else
+  {
+   intValue = defaultValue;
+  }
+ }
+
+ private void WriteActorAngle(Box actor, int angle)
+ {
+  ProcessMemoryReader ProcessReader = GetComponent<DosBox>().ProcessReader;
+
+  int index = Actors.GetComponentsInChildren<Box>(true).ToList().IndexOf(actor);
+  if (index != -1)
+  {
+   long offset = GetComponent<DosBox>().GetActorMemoryAddress(index);
+   byte[] position = new byte[2];
+   Utils.Write((short)angle, position, 0);
+   ProcessReader.Write(position, offset + 42, 2);
+
+   warpActor.Angles.y = angle;
+  }
+ }
+
+ private void WriteActorPosition(Box actor, Vector3 lowerBound, Vector3 upperBound, Vector3 localPosition, Vector3 worldPosition)
+ {
+  ProcessMemoryReader ProcessReader = GetComponent<DosBox>().ProcessReader;
+
+  //get object offset
+  int index = Actors.GetComponentsInChildren<Box>(true).ToList().IndexOf(actor);
+  if(index != -1)
+  {
+   long offset = GetComponent<DosBox>().GetActorMemoryAddress(index);
+
+   //update to memory
+   //bounds
+   byte[] buffer = new byte[12];
+   Utils.Write((short)lowerBound.x, buffer, 0);
+   Utils.Write((short)upperBound.x, buffer, 2);
+   Utils.Write((short)lowerBound.y, buffer, 4);
+   Utils.Write((short)upperBound.y, buffer, 6);
+   Utils.Write((short)lowerBound.z, buffer, 8);
+   Utils.Write((short)upperBound.z, buffer, 10);
+   ProcessReader.Write(buffer, offset + 8, 12);
+
+   //local+world
+   Utils.Write((short)localPosition.x, buffer, 0);
+   Utils.Write((short)localPosition.y, buffer, 2);
+   Utils.Write((short)localPosition.z, buffer, 4);
+   Utils.Write((short)worldPosition.x, buffer, 6);
+   Utils.Write((short)worldPosition.y, buffer, 8);
+   Utils.Write((short)worldPosition.z, buffer, 10);
+   ProcessReader.Write(buffer, offset + 28, 12);
+
+   warpActor.LocalPosition = localPosition;
+   warpActor.WorldPosition = worldPosition;
+   warpActor.BoundingLower = lowerBound;
+   warpActor.BoundingUpper = upperBound;
+  }
+ }  
+}
+using UnityEngine;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Globalization;
+using System;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using System.Text;
+
+public class ModelLoader : MonoBehaviour
+{
+ private int modelIndex = 0;
+ private int animIndex = 0;
+ private int modelFolderIndex = 0;
+
+ private KeyCode[] keyCodes = Enum.GetValues(typeof(KeyCode)).Cast<KeyCode>().ToArray();
+ private VarParser varParser = new VarParser();
+
+ private string[] modelFolders = new string[] { "GAMEDATA\\LISTBODY", "GAMEDATA\\LISTBOD2" };
+ private string[] animFolders = new string[] { "GAMEDATA\\LISTANIM", "GAMEDATA\\LISTANI2" };
+ private List<string> modelFiles = new List<string>();
+ private List<string> animFiles = new List<string>();
+ private List<Frame> animFrames;
+ private List<Transform> bones;
+ private List<Vector3> initialBonesPosition;
+
+ private int PaletteIndex;
+ public Texture2D[] PaletteTexture;
+ public Text LeftText;
+ public Mesh SphereMesh;
+ public Mesh CubeMesh;
+ private List<List<int>> gradientPolygonList;
+ private List<int> gradientPolygonType;
+ private Mesh bakedMesh;
+ private List<Vector3> allVertices;
+ private List<Vector2> uv;
+
+ private Vector2 cameraRotation = new Vector2();
+ private Vector2 cameraPosition = new Vector2();
+ private float cameraZoom = 2.0f;
+
+ private Vector3 mousePosition;
+ //mouse drag
+ private bool autoRotate;
+ private bool displayMenuAfterDrag;
+ private bool menuEnabled;
+ private string LeftTextBody;
+ private string LeftTextAnim;
+
+ public RectTransform Panel;
+ public InputField ModelInput;
+ public InputField AnimationInput;
+ public ToggleButton AutoRotate;
+ public ToggleButton GradientMaterial;
+ public ToggleButton NoiseMaterial;
+ public ToggleButton EnableAnimation;
+ public ToggleButton ShowAdditionalInfo;
+
+ void LoadBody(string filename, bool resetcamera = true)
+ {
+  string varName = varParser.GetText("BODYS", modelIndex);
+  string folderName = modelFolders[modelFolderIndex];
+  LeftTextBody = folderName.Substring(folderName.Length - 4) + " " + modelIndex + "/" + (modelFiles.Count - 1) + " <color=#00c864>" + varName + "</color>";
+  RefreshLeftText();
+
+  //camera
+  if (resetcamera)
+  {
+   autoRotate = true;
+   cameraPosition = Vector2.zero;
+  }
+
+  //clear model
+  SkinnedMeshRenderer filter = this.gameObject.GetComponent<SkinnedMeshRenderer>();
+  filter.sharedMesh = null;
+
+  //delete all bones
+  foreach (Transform child in transform) {
+   GameObject.Destroy(child.gameObject);
+  }
+
+  //load data
+  byte[] allbytes = File.ReadAllBytes(filename);
+  int i = 0;
+
+  //header
+  int flags = Utils.ReadShort(allbytes, i + 0);
+  i += 0xE;
+  i += Utils.ReadShort(allbytes, i + 0) + 2;
+
+  //vertexes
+  int count = Utils.ReadShort(allbytes, i + 0);
+  i += 2;
+
+  List<Vector3> vertices = new List<Vector3>();
+  for (int j = 0; j < count; j++)
+  {
+   Vector3 position = new Vector3(Utils.ReadShort(allbytes, i + 0), -Utils.ReadShort(allbytes, i + 2), Utils.ReadShort(allbytes, i + 4));
+   vertices.Add(position / 1000.0f);
+   i += 6;
+  }
+
+  //check if model has bones
+  bones = new List<Transform>();
+  List<Matrix4x4> bindPoses = new List<Matrix4x4>();
+  Dictionary<int, int> bonesPerVertex = new Dictionary<int, int>();
+  List<Vector3> vertexNoTransform = vertices.ToList();
+
+  if ((flags & 2) == 2)
+  {
+   //bones
+   count = Utils.ReadShort(allbytes, i + 0);
+   i += 2;
+   i += count * 2;
+
+   Dictionary<int, Transform> bonesPerIndex = new Dictionary<int, Transform>();
+
+   bonesPerIndex.Add(255, transform);
+   for (int n = 0; n < count; n++)
+   {
+    int startindex = Utils.ReadShort(allbytes, i + 0) / 6;
+    int numpoints = Utils.ReadShort(allbytes, i + 2);
+    int vertexindex = Utils.ReadShort(allbytes, i + 4) / 6;
+    int parentindex = allbytes[i + 6];
+    int boneindex = allbytes[i + 7];
+
+    //create bone
+    Transform bone = new GameObject("BONE").transform;
+    bonesPerIndex.Add(boneindex, bone);
+
+    bone.parent = bonesPerIndex[parentindex];
+    bone.localRotation = Quaternion.identity;
+    bone.localPosition = vertexNoTransform[vertexindex];
+    bones.Add(bone);
+
+    //create pose
+    Matrix4x4 bindPose = new Matrix4x4();
+    bindPose = bone.worldToLocalMatrix * transform.localToWorldMatrix;
+    bindPoses.Add(bindPose);
+
+    //apply bone transformation
+    Vector3 position = vertices[vertexindex];
+    for (int u = 0; u < numpoints; u++)
+    {
+     vertices[startindex] += position;
+     bonesPerVertex.Add(startindex, bones.Count - 1);
+     startindex++;
+    }
+
+    i += 0x10;
+   }
+  }
+  else
+  {
+   //if no bones add dummy values
+   for (int u = 0; u < vertices.Count; u++)
+   {
+    bonesPerVertex.Add(u, 0);
+   }
+  }
+
+  //compute line size
+  Bounds bounds = new Bounds();
+  foreach (Vector3 vector in vertices)
+  {
+   bounds.Encapsulate(vector);
+  }
+  float linesize = bounds.size.magnitude / 250.0f;
+  float noisesize = 0.8f / bounds.size.magnitude;
+
+  //primitives
+  count = Utils.ReadShort(allbytes, i + 0);
+  i += 2;
+
+  //load palette
+  Color32[] paletteColors = PaletteTexture[PaletteIndex].GetPixels32();
+
+  List<BoneWeight> boneWeights = new List<BoneWeight>();
+  allVertices = new List<Vector3>();
+  uv = new List<Vector2>();
+  List<Color32> colors = new List<Color32>();
+  List<int>[] indices = new List<int>[5];
+
+  for (int n = 0 ; n < indices.Length ; n++)
+  {
+   indices[n] = new List<int>();
+  }
+
+  gradientPolygonList = new List<List<int>>();
+  gradientPolygonType = new List<int>();
+
+  for (int n = 0; n < count; n++)
+  {
+   int primitiveType = allbytes[i + 0];
+   i++;
+
+   switch (primitiveType)
+   {
+    //line
+    case 0:
+     {
+      i++;
+      int colorIndex = allbytes[i + 0];
+      i += 2;
+
+      Color32 color = paletteColors[colorIndex];
+      int pointIndexA = Utils.ReadShort(allbytes, i + 0) / 6;
+      int pointIndexB = Utils.ReadShort(allbytes, i + 2) / 6;
+      Vector3 directionVector = vertices[pointIndexA] - vertices[pointIndexB];
+      Vector3 middle = (vertices[pointIndexA] + vertices[pointIndexB]) / 2.0f;
+      Quaternion rotation = Quaternion.LookRotation(directionVector);
+
+      uv.AddRange(CubeMesh.uv);
+      indices[0].AddRange(CubeMesh.triangles.Select(x => x + allVertices.Count));
+      allVertices.AddRange(CubeMesh.vertices.Select(x =>
+       rotation * (Vector3.Scale(x, new Vector3(linesize, linesize, directionVector.magnitude)))
+       + middle));
+      colors.AddRange(CubeMesh.vertices.Select(x => color));
+      boneWeights.AddRange(CubeMesh.vertices.Select(x => new BoneWeight() { boneIndex0 = bonesPerVertex[x.z > 0 ? pointIndexA : pointIndexB], weight0 = 1 }));
+
+      i += 4;
+      break;
+     }
+    //polygon
+    case 1:
+     {
+      int numPoints = allbytes[i + 0];
+      int polyType = allbytes[i + 1];
+      int colorIndex = allbytes[i + 2];
+      i += 3;
+
+      Color32 color = GetPaletteColor(paletteColors, colorIndex, polyType);
+      List<int> triangleList = indices[GetTriangleListIndex(polyType)];
+
+      //add vertices     
+      List<int> polyVertices = new List<int>();
+      int verticesCount = allVertices.Count;
+      for (int m = 0; m < numPoints; m++)
+      {
+       int pointIndex = Utils.ReadShort(allbytes, i + 0) / 6;
+       i += 2;
+
+       colors.Add(color);
+       polyVertices.Add(allVertices.Count);
+       allVertices.Add(vertices[pointIndex]);
+       boneWeights.Add(new BoneWeight() { boneIndex0 = bonesPerVertex[pointIndex], weight0 = 1 });
+      }
+       
+      if ((polyType == 3 || polyType == 4 || polyType == 5 || polyType == 6) && GradientMaterial.BoolValue)
+      {
+       gradientPolygonType.Add(polyType);
+       gradientPolygonList.Add(polyVertices);
+      }
+
+      if (polyType == 1 && NoiseMaterial.BoolValue)
+      {
+       Vector3 forward, left;
+       ComputeUV(polyVertices, out forward, out left);
+
+       foreach (int pointIndex in polyVertices)
+       {
+        Vector3 poly = allVertices[pointIndex];
+
+        uv.Add(new Vector2(
+         Vector3.Dot(poly, left) * noisesize,
+         Vector3.Dot(poly, forward) * noisesize
+        ));
+       }
+      }
+      else
+      {
+       uv.AddRange(polyVertices.Select(x => Vector2.zero));
+      }
+
+      //triangulate
+      int v0 = 0;
+      int v1 = 1;
+      int v2 = numPoints - 1;
+      bool swap = true;
+
+      while (v1 < v2)
+      {
+       triangleList.Add(verticesCount + v0);
+       triangleList.Add(verticesCount + v1);
+       triangleList.Add(verticesCount + v2);
+
+       if (swap)
+       {
+        v0 = v1;
+        v1++;
+       }
+       else
+       {
+        v0 = v2;
+        v2--;
+       }
+
+       swap = !swap;
+      }
+
+      break;
+     }
+    //sphere
+    case 3:
+     {
+      int polyType = allbytes[i];
+      i++;
+      int colorIndex = allbytes[i];
+      Color32 color = GetPaletteColor(paletteColors, colorIndex, polyType);
+      List<int> triangleList = indices[GetTriangleListIndex(polyType)];
+
+      i += 2;
+
+      int size = Utils.ReadShort(allbytes, i + 0);
+      i += 2;
+      int pointSphereIndex = Utils.ReadShort(allbytes, i + 0) / 6;
+      i += 2;
+
+      Vector3 position = vertices[pointSphereIndex];
+      float scale = size / 500.0f;
+      float uvScale = noisesize * size / 200.0f;
+
+      if ((polyType == 3 || polyType == 4 || polyType == 5 || polyType == 6) && GradientMaterial.BoolValue)
+      {
+       gradientPolygonType.Add(polyType);
+       gradientPolygonList.Add(SphereMesh.triangles.Select(x => x + allVertices.Count).ToList());
+      }
+
+      uv.AddRange(SphereMesh.uv.Select(x => x * uvScale));
+      triangleList.AddRange(SphereMesh.triangles.Select(x => x + allVertices.Count));
+      allVertices.AddRange(SphereMesh.vertices.Select(x => x * scale + position));
+      colors.AddRange(SphereMesh.vertices.Select(x => color));
+      boneWeights.AddRange(SphereMesh.vertices.Select(x => new BoneWeight() { boneIndex0 = bonesPerVertex[pointSphereIndex], weight0 = 1 }));
+      break;
+     }
+
+    case 2: //1x1 pixel
+    case 6: //square
+    case 7:
+     {
+      i++;
+      int colorIndex = allbytes[i];
+      i += 2;
+      int cubeIndex = Utils.ReadShort(allbytes, i + 0) / 6;
+      i += 2;
+
+      Color32 color = paletteColors[colorIndex];
+      Vector3 position = vertices[cubeIndex];
+
+      float pointsize;
+      if (primitiveType == 2)
+      {
+       pointsize = linesize;
+      }
+      else
+      {
+       pointsize = linesize * 2.5f;
+      }
+
+      uv.AddRange(CubeMesh.uv);
+      indices[0].AddRange(CubeMesh.triangles.Select(x => x + allVertices.Count));
+      allVertices.AddRange(CubeMesh.vertices.Select(x => x * pointsize + position));
+      colors.AddRange(CubeMesh.vertices.Select(x => color));
+      boneWeights.AddRange(CubeMesh.vertices.Select(x => new BoneWeight() { boneIndex0 = bonesPerVertex[cubeIndex], weight0 = 1 }));
+      break;
+     }
+    default:
+     throw new UnityException("unknown primitive " + primitiveType.ToString() + " at " + i.ToString());
+   }
+
+  }
+
+  // Create the mesh
+  Mesh msh = new Mesh();
+  msh.vertices = allVertices.ToArray();
+  msh.colors32 = colors.ToArray();
+
+  //separate transparent/opaque triangles
+
+  msh.subMeshCount = 5;
+  msh.SetTriangles(indices[0], 0);
+  msh.SetTriangles(indices[1], 1);
+  msh.SetTriangles(indices[2], 2);
+  msh.SetTriangles(indices[3], 3);
+  msh.SetTriangles(indices[4], 4);
+  msh.SetUVs(0, uv);
+  msh.RecalculateNormals();
+  msh.RecalculateBounds();
+
+  //apply bones
+  if(bones.Count > 0)
+  {
+   msh.boneWeights = boneWeights.ToArray();
+   msh.bindposes = bindPoses.ToArray();
+   GetComponent<SkinnedMeshRenderer>().bones = bones.ToArray();
+   initialBonesPosition = bones.Select(x => x.localPosition).ToList();
+  }
+
+  filter.localBounds = msh.bounds;
+  filter.sharedMesh = msh;
+ }
+  
+ int GetTriangleListIndex(int polyType)
+ {
+  switch (polyType)
+  {
+   default:
+   case 0: //single color
+    return 0;
+
+   case 1: //noise
+    if (NoiseMaterial.BoolValue)
+     return 2;
+    else
+     return 0;
+    
+   case 2: //transparent
+    return 1;
+
+   case 3: //gradient
+   case 6: 
+    if (GradientMaterial.BoolValue)
+     return 3;
+    else
+     return 0;
+
+   case 4:
+   case 5:
+    if (GradientMaterial.BoolValue)
+     return 4;
+    else
+     return 0;
+  }
+ }
+
+ Color32 GetPaletteColor(Color32[] paletteColors, int colorIndex, int polyType)
+ {
+  Color32 color = paletteColors[colorIndex];
+
+  if (polyType == 1 && NoiseMaterial.BoolValue)
+  {
+   //noise
+   color.r = (byte)((colorIndex % 16) * 16);
+   color.g = (byte)((colorIndex / 16) * 16);
+  }
+  else if (polyType == 2)
+  {
+   //transparency
+   color.a = 128;
+  }
+  else if ((polyType == 3 || polyType == 6 || polyType == 4 || polyType == 5) && GradientMaterial.BoolValue)
+  {
+   //horizontal or vertical gradient
+   color.r = (byte)((polyType == 5) ? 127 : 255);
+   color.b = (byte)((colorIndex / 16) * 16);
+   color.a = (byte)((colorIndex % 16) * 16);
+  }
+
+  return color;
+ }
+
+ class Frame
+ {
+  public float Time;
+  public float OffsetX;
+  public float OffsetY;
+  public float OffsetZ;
+  public List<Vector4> Bones;
+ }
+
+ void LoadAnim(string filename)
+ {
+  string varName = varParser.GetText("ANIMS", animIndex);
+  string folderName = animFolders[modelFolderIndex];
+  LeftTextAnim = folderName.Substring(folderName.Length - 4) + " " + animIndex + "/" + (animFiles.Count - 1) + " <color=#00c864>" + varName + "</color>";
+
+  int i = 0;
+  byte[] allbytes = File.ReadAllBytes(filename);
+  int frameCount = Utils.ReadShort(allbytes, i + 0);
+  int boneCount = Utils.ReadShort(allbytes, i + 2);
+  i += 4;
+
+  animFrames = new List<Frame>();
+  for(int frame = 0 ; frame < frameCount ; frame++)
+  {
+   Frame f = new Frame();
+   f.Time = Utils.ReadShort(allbytes, i + 0);
+   f.OffsetX = Utils.ReadShort(allbytes, i + 2);
+   f.OffsetY = Utils.ReadShort(allbytes, i + 4);
+   f.OffsetZ = Utils.ReadShort(allbytes, i + 6);
+
+   f.Bones = new List<Vector4>();
+   i += 8;
+   for(int bone = 0 ; bone < boneCount ; bone++)
+   {
+    int type = Utils.ReadShort(allbytes, i + 0);
+    int x = Utils.ReadShort(allbytes, i + 2);
+    int y = Utils.ReadShort(allbytes, i + 4);
+    int z = Utils.ReadShort(allbytes, i + 6);
+
+    if(type == 0) //rotate
+    {
+     f.Bones.Add(new Vector4(-x * 360 / 1024.0f, -y * 360 / 1024.0f, -z * 360 / 1024.0f, type));
+    }
+
+    else if(type == 1) //translate
+    {
+     f.Bones.Add(new Vector4(x / 1000.0f, -y / 1000.0f, z / 1000.0f, type));
+    }
+    else //scale
+    {
+     f.Bones.Add(new Vector4(x / 1024.0f + 1.0f, y / 1024.0f + 1.0f, z / 1024.0f + 1.0f, type));
+    }
+    i += 8;
+   }
+
+   animFrames.Add(f);
+  }
+
+  RefreshLeftText();
+ }
+
+ void AnimateModel()
+ {
+  float totaltime = animFrames.Sum(x => x.Time);
+  float time = (Time.time * 50.0f) % totaltime;
+
+  //find current frame
+  totaltime = 0.0f;
+  int frame = 0;
+  for (int i = 0 ; i < animFrames.Count ; i++)
+  {
+   totaltime += animFrames[(i + 1) % animFrames.Count].Time;
+   if(time < totaltime)
+   {
+    frame = i;
+    break;
+   }
+  }
+
+  Frame currentFrame = animFrames[frame % animFrames.Count];
+  Frame nextFrame = animFrames[(frame + 1) % animFrames.Count];
+  float framePosition = (time - (totaltime - nextFrame.Time)) / nextFrame.Time;
+
+  for (int i = 0 ; i < bones.Count; i++)
+  {
+   Transform boneTransform = bones[i].transform;
+
+   if(i >= currentFrame.Bones.Count)
+   {
+    //there is more bones in model than anim
+    boneTransform.localPosition = initialBonesPosition[i];
+    boneTransform.localRotation = Quaternion.identity;
+    boneTransform.localScale = Vector3.one;
+    continue;
+   }
+
+   var currentBone = currentFrame.Bones[i];
+   var nextBone = nextFrame.Bones[i];
+
+   //interpolate
+   if (nextBone.w == 0.0f)
+   {
+    //rotation
+    boneTransform.localPosition = initialBonesPosition[i];
+    boneTransform.localScale = Vector3.one;
+    boneTransform.localRotation =
+     Quaternion.Slerp(
+      Quaternion.AngleAxis(currentBone.z, Vector3.forward) *
+      Quaternion.AngleAxis(currentBone.x, Vector3.right) *
+      Quaternion.AngleAxis(currentBone.y, Vector3.up),
+      Quaternion.AngleAxis(nextBone.z, Vector3.forward) *
+      Quaternion.AngleAxis(nextBone.x, Vector3.right) *
+      Quaternion.AngleAxis(nextBone.y, Vector3.up),
+      framePosition);
+   }
+   else if (nextBone.w == 1.0f)
+   {
+    //position
+    boneTransform.localRotation = Quaternion.identity;
+    boneTransform.localScale = Vector3.one;
+    boneTransform.localPosition = initialBonesPosition[i] +
+     Vector3.Lerp(
+      new Vector3(currentBone.x, currentBone.y, currentBone.z),
+      new Vector3(nextBone.x, nextBone.y, nextBone.z),
+      framePosition);
+   }
+   else
+   {
+    //scaling
+    boneTransform.localRotation = Quaternion.identity;
+    boneTransform.localPosition = initialBonesPosition[i];
+    boneTransform.localScale =
+     Vector3.Lerp(
+      new Vector3(currentBone.x, currentBone.y, currentBone.z),
+      new Vector3(nextBone.x, nextBone.y, nextBone.z),
+      framePosition);
+   }
+  }
+ }
+
+ void ComputeUV(List<int> polyVertices, out Vector3 forward, out Vector3 left)
+ {
+  int lastPoly = polyVertices.Count - 1;
+  Vector3 up;
+  do
+  {
+   Vector3 a = allVertices[polyVertices[0]];
+   Vector3 b = allVertices[polyVertices[1]];
+   Vector3 c = allVertices[polyVertices[lastPoly]];
+   left = (b - a).normalized;
+   forward = (c - a).normalized;
+   up = Vector3.Cross(left, forward).normalized;
+   left = Vector3.Cross(up, forward).normalized;
+   lastPoly--;
+  } while (up == Vector3.zero && lastPoly > 1);
+ }
+
+ void Start()
+ {
+  //parse vars.txt file
+  string varPath = @"GAMEDATA\vars.txt";
+  if (File.Exists(varPath))
+  {
+   varParser.Parse(varPath);
+  }
+
+  if(!Directory.Exists(modelFolders[1]))
+  {
+   Array.Resize(ref modelFolders, 1);
+  }
+
+  //load first model
+  modelIndex = 0;
+  LoadModels(modelFolders[modelFolderIndex]);
+  LoadAnims(animFolders[modelFolderIndex]);
+  ToggleAnimationMenuItems(false);
+ }
+
+ int DetectGame()
+ {
+  //detect game based on number of models
+  if (modelFiles.Count > 700)
+   return 3;
+  else if (modelFiles.Count > 500)
+   return 2;
+  else
+   return 1;
+ }
+
+ void SetPalette()
+ {
+  PaletteIndex = DetectGame() - 1;
+
+  GetComponent<SkinnedMeshRenderer>().materials[2] //noise
+   .SetTexture("_Palette", PaletteTexture[PaletteIndex]);
+  GetComponent<SkinnedMeshRenderer>().materials[3] //gradient
+   .SetTexture("_Palette", PaletteTexture[PaletteIndex]);
+  GetComponent<SkinnedMeshRenderer>().materials[4] //gradient2
+   .SetTexture("_Palette", PaletteTexture[PaletteIndex]);
+ }
+
+ void LoadModels(string foldername)
+ {
+  if (Directory.Exists(foldername))
+  {
+   modelFiles = Directory.GetFiles(foldername)
+    .OrderBy(x => int.Parse(Path.GetFileNameWithoutExtension(x), NumberStyles.HexNumber)).ToList();
+
+   SetPalette();
+   LoadBody(modelFiles[modelIndex]);
+  }
+  else
+  {
+   LeftText.text = string.Format("Cannot find folder {0}", foldername);
+  }
+ }
+
+ void LoadAnims(string foldername)
+ {
+  if (Directory.Exists(foldername))
+  {
+   animFiles = Directory.GetFiles(foldername)
+    .OrderBy(x => int.Parse(Path.GetFileNameWithoutExtension(x), NumberStyles.HexNumber)).ToList();
+
+   if(EnableAnimation.BoolValue)
+   {
+    LoadAnim(animFiles[animIndex]);
+   }
+  }
+ }
+
+ void Update()
+ {
+  int oldModelIndex = modelIndex;
+  int oldAnimIndex = animIndex;
+
+  if (Input.GetAxis("Mouse ScrollWheel") > 0)
+  {
+   if (cameraZoom > 0.1f)
+    cameraZoom *= 0.9f;
+  }
+
+  if (Input.GetAxis("Mouse ScrollWheel") < 0)
+  {
+   cameraZoom *= 1.0f / 0.9f;
+  }
+
+  //process keys
+  foreach (var key in keyCodes)
+  {
+   if (Input.GetKeyDown(key))
+   {
+    ProcessKey(key);
+   }
+  }
+
+  if (!menuEnabled)
+  {
+   //start drag (rotate)
+   if (Input.GetMouseButtonDown(0))
+   {
+    mousePosition = Input.mousePosition;
+    autoRotate = false;
+   }
+
+   //dragging (rotate)
+   if (Input.GetMouseButton(0))
+   {
+    Vector2 mouseDelta = mousePosition - Input.mousePosition;
+    cameraRotation += mouseDelta;
+    cameraRotation.y = Mathf.Clamp(cameraRotation.y, -90.00f, 90.00f);
+    mousePosition = Input.mousePosition;
+   }
+
+   //start drag (pan)
+   if (Input.GetMouseButtonDown(1))
+   {
+    mousePosition = Input.mousePosition;
+    autoRotate = false;
+    displayMenuAfterDrag = true;
+   }
+
+   //dragging (pan)
+   if (Input.GetMouseButton(1))
+   {
+    Vector3 newMousePosition = Input.mousePosition;
+    if (newMousePosition != this.mousePosition)
+    {
+     Vector3 cameraDistance = new Vector3(0.0f, 0.0f, cameraZoom);
+     Vector2 mouseDelta = Camera.main.ScreenToWorldPoint(this.mousePosition + cameraDistance)
+      - Camera.main.ScreenToWorldPoint(newMousePosition + cameraDistance);
+     displayMenuAfterDrag = false;
+     cameraPosition += mouseDelta;
+     mousePosition = newMousePosition;
+    }
+   }
+  }
+
+  //end drag (pan)
+  if (Input.GetMouseButtonUp(1))
+  {
+   //show/hide menu
+   if (displayMenuAfterDrag)
+   {
+    menuEnabled = !menuEnabled;
+    if (menuEnabled)
+    {
+     ModelInput.text = modelIndex.ToString();
+     AnimationInput.text = animIndex.ToString();
+    }
+   }
+  }
+
+  if (Input.GetMouseButtonUp(0)
+   && !RectTransformUtility.RectangleContainsScreenPoint(Panel, Input.mousePosition))
+  {
+   menuEnabled = false;
+  }
+
+  Panel.gameObject.SetActive(menuEnabled);
+
+  modelIndex = Math.Min(Math.Max(modelIndex, 0), modelFiles.Count - 1);
+  animIndex = Math.Min(Math.Max(animIndex, 0), animFiles.Count - 1);
+
+  //load new model if needed
+  if (modelFiles.Count > 0 && oldModelIndex != modelIndex)
+  {
+   ModelInput.text = modelIndex.ToString();
+   LoadBody(modelFiles[modelIndex]);
+  }
+
+  if (animFiles.Count > 0 && oldAnimIndex != animIndex)
+  {
+   AnimationInput.text = animIndex.ToString();
+   LoadAnim(animFiles[animIndex]);
+  }
+
+  //rotate model
+  if (autoRotate && AutoRotate.BoolValue)
+  {
+   cameraRotation.x = Time.time * 100.0f;
+   cameraRotation.y = 20.0f;
+  }
+
+  //animate
+  if(animFrames != null)
+  {
+   AnimateModel();
+  }
+
+  //update model
+  transform.position = Vector3.zero;
+  transform.rotation = Quaternion.identity;
+  Vector3 center = Vector3.Scale(gameObject.GetComponent<Renderer>().bounds.center, Vector3.up);
+
+  transform.position = -(Quaternion.AngleAxis(cameraRotation.y, Vector3.left) * center);
+  transform.rotation = Quaternion.AngleAxis(cameraRotation.y, Vector3.left)
+   * Quaternion.AngleAxis(cameraRotation.x, Vector3.up);
+
+  //set camera
+  Camera.main.transform.position = Vector3.back * cameraZoom + new Vector3(cameraPosition.x, cameraPosition.y, 0.0f);
+  Camera.main.transform.rotation = Quaternion.AngleAxis(0.0f, Vector3.left);
+
+  if (GradientMaterial.BoolValue)
+  {
+   UpdateGradientsUVs();
+  }
+ }
+
+ void UpdateGradientsUVs()
+ {
+  Mesh mesh = gameObject.GetComponent<SkinnedMeshRenderer>().sharedMesh;
+  
+  if (EnableAnimation.BoolValue)
+  {
+   if (bakedMesh == null)
+   {
+    bakedMesh = new Mesh();
+   }
+
+   gameObject.GetComponent<SkinnedMeshRenderer>().BakeMesh(bakedMesh);
+   bakedMesh.GetVertices(allVertices);
+  }
+
+  float gmaxY = 0.0f;
+  float gminY = 1.0f;
+
+  bool pointBehindCameraForAnyPoly = false; 
+  for (int i = 0 ; i < gradientPolygonList.Count ; i++)
+  {
+   float maxX = 0.0f;
+   float minX = 1.0f;
+   float maxY = 0.0f;
+   float minY = 1.0f;
+
+   int polyType = gradientPolygonType[i];
+
+   bool pointBehindCamera = false;
+   foreach(int vertexIndex in gradientPolygonList[i])
+   {
+    Vector3 poly = allVertices[vertexIndex];
+    Vector3 point = Camera.main.WorldToViewportPoint(transform.TransformPoint(poly));
+
+    if (point.z <= 0.0f)
+    {
+     pointBehindCamera = true;
+     pointBehindCameraForAnyPoly = true;
+     break;
+    }
+
+    if (point.y > maxY)
+    {
+     maxY = point.y;
+    }
+
+    if (point.y < minY)
+    {
+     minY = point.y;
+    }
+
+    if (point.y > gmaxY)
+    {
+     gmaxY = point.y;
+    }
+
+    if (point.y < gminY)
+    {
+     gminY = point.y;
+    }
+
+    if (point.x > maxX)
+    {
+     maxX = point.x;
+    }
+
+    if (point.x < minX)
+    {
+     minX = point.x;
+    }
+   }
+
+   if (!pointBehindCamera)
+   {
+    minX = Mathf.Clamp01(minX);
+    maxX = Mathf.Clamp01(maxX);
+    minY = Mathf.Clamp01(minY);
+    maxY = Mathf.Clamp01(maxY);
+
+    foreach (int vertexIndex in gradientPolygonList[i])
+    {
+     switch (polyType)
+     {
+      case 4:
+      case 5: //vertical gradient
+       uv[vertexIndex] = new Vector2(maxY, 0.0f);    
+       break;
+
+      case 3: //horizontal
+       uv[vertexIndex] = new Vector2(minX, maxX);    
+       break;
+
+      case 6: //horizontal (reversed)
+       uv[vertexIndex] = new Vector2(maxX, minX);    
+       break;
+     }
+    }
+   }
+  }
+
+  if (!pointBehindCameraForAnyPoly)
+  {
+   for (int i = 0; i < gradientPolygonList.Count; i++)
+   {
+    foreach (int polyIndex in gradientPolygonList[i])
+    {
+     int polyType = gradientPolygonType[i];
+     if (polyType == 4 || polyType == 5)
+     {
+      uv[polyIndex] = new Vector2(uv[polyIndex].x, gmaxY - gminY);    
+     }
+    }
+   }
+  }
+  mesh.SetUVs(0, uv);
+ }
+
+ void RefreshLeftText()
+ {
+  StringBuilder stringBuilder = new StringBuilder();
+  stringBuilder.Append(LeftTextBody);
+  if(EnableAnimation.BoolValue)
+  {
+   stringBuilder.Append("\r\n" + LeftTextAnim);
+   if(ShowAdditionalInfo.BoolValue && animFrames != null)
+   {
+    int index = 0;
+    stringBuilder.Append("\r\n\r\n");
+    foreach(Frame frame in animFrames)
+    {
+     stringBuilder.AppendFormat("Frame {0}: <color=#00c864>{1} {2} {3} {4}</color>\r\n", index, frame.Time, frame.OffsetX, frame.OffsetY, -frame.OffsetZ);
+     index++;
+    }
+   }
+  }
+
+  LeftText.text = stringBuilder.ToString();
+ }
+
+ public void ToggleAnimationMenuItems(bool enabled)
+ {
+  AnimationInput.transform.parent.gameObject.SetActive(enabled);
+  ShowAdditionalInfo.transform.parent.gameObject.SetActive(enabled);
+  Panel.sizeDelta = new Vector2(Panel.sizeDelta.x, Panel.Cast<Transform>().Count(x => x.gameObject.activeSelf) * 30.0f);
+ }
+
+ public void ModelIndexInputChanged()
+ {
+  int newModelIndex;
+  if(int.TryParse(ModelInput.text, out newModelIndex) && newModelIndex != modelIndex)
+  {
+   modelIndex = Math.Min(Math.Max(newModelIndex, 0), modelFiles.Count - 1);
+   ModelInput.text = modelIndex.ToString();
+   LoadBody(modelFiles[modelIndex]);
+  }
+ }
+
+ public void AnimationIndexInputChanged()
+ {
+  int newAnimIndex;
+  if(int.TryParse(AnimationInput.text, out newAnimIndex) && newAnimIndex != animIndex)
+  {
+   animIndex = Math.Min(Math.Max(newAnimIndex, 0), animFiles.Count - 1);
+   AnimationInput.text = animIndex.ToString();
+   LoadAnim(animFiles[animIndex]);
+  }
+ }
+
+ public void ProcessKey(string keyCode)
+ {
+  KeyCode keyCodeEnum = (KeyCode)Enum.Parse(typeof(KeyCode), keyCode, true);
+  ProcessKey(keyCodeEnum);
+ }
+
+ void ProcessKey(KeyCode code)
+ {
+  switch (code)
+  {
+   case KeyCode.LeftArrow:
+    if (Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift))
+    {
+     modelIndex -= 10;
+    }
+    else
+    {
+     modelIndex--;
+    }
+    break;
+
+   case KeyCode.RightArrow:
+    if (Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift))
+    {
+     modelIndex += 10;
+    }
+    else
+    {
+     modelIndex++;
+    }
+    break;
+
+   case KeyCode.Space:
+    modelFolderIndex = (modelFolderIndex + 1) % modelFolders.Length;
+    LoadModels(modelFolders[modelFolderIndex]);
+    LoadAnims(animFolders[modelFolderIndex]);
+    break;
+
+   case KeyCode.UpArrow:
+    if(EnableAnimation.BoolValue)
+    {
+     if (Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift))
+     {
+      animIndex += 10;
+     }
+     else
+     {
+      animIndex++;
+     }
+    }
+    break;
+
+   case KeyCode.DownArrow:
+    if(EnableAnimation.BoolValue)
+    {
+     if (Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift))
+     {
+      animIndex -= 10;
+     }
+     else
+     {
+      animIndex--;
+     }
+    }
+    break;
+
+   case KeyCode.A:
+    if (animFiles.Count > 0)
+    {
+     EnableAnimation.BoolValue = !EnableAnimation.BoolValue;
+     ToggleAnimationMenuItems(EnableAnimation.BoolValue);
+     if (EnableAnimation.BoolValue)
+     {
+      LoadAnim(animFiles[animIndex]);
+     }
+     else
+     {
+      animFrames = null;
+      LoadBody(modelFiles[modelIndex], false);
+     }
+    }
+    break;
+
+   case KeyCode.E:
+    ShowAdditionalInfo.BoolValue = !ShowAdditionalInfo.BoolValue;
+    RefreshLeftText();
+    break;
+
+   case KeyCode.G:
+    GradientMaterial.BoolValue = !GradientMaterial.BoolValue;
+    LoadBody(modelFiles[modelIndex], false);
+    break;
+
+   case KeyCode.N:
+    NoiseMaterial.BoolValue = !NoiseMaterial.BoolValue;
+    LoadBody(modelFiles[modelIndex], false);
+    break;
+
+   case KeyCode.R:
+    AutoRotate.BoolValue = !AutoRotate.BoolValue;
+    if (AutoRotate.BoolValue)
+    {
+     autoRotate = true;
+    }
+    break;
+
+   case KeyCode.Escape:
+    if (Screen.fullScreen)
+    {
+     Application.Quit();
+    }
+    break;
+
+   case KeyCode.Tab:
+    SceneManager.LoadScene("room");
+    break;
+  }
+ }
+}
+using UnityEngine;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System;
+using System.Text;
+
+public class Box : MonoBehaviour
+{
+ private Color32 color;
+ private bool highlighted;
+ private bool alwaysOnTop;
+ private static string[] animTypeInfo = new string[] { "ONCE", "REPEAT", "UNINTERRUPT" };
+
+ public bool ShowAdditionalInfo;
+ public int ID;
+ public int Flags;
+ public int ColFlags;
+ public int Life;
+ public int LifeMode;
+ public int TrackMode;
+ public int Body;
+ public int Anim;
+ public int NextAnim;
+ public int AnimType;
+ public int Keyframe;
+ public int TotalFrames;
+ public int Speed;
+ public int Room;
+ public int Floor;
+ public uint Chrono;
+ public uint RoomChrono;
+ public int TrackNumber;
+ public int PositionInTrack;
+ public int Slot;
+ public Timer lastKeyFrameChange = new Timer();
+ public Vector3 LocalPosition;
+ public Vector3 WorldPosition;
+ public Vector3 BoundingLower;
+ public Vector3 BoundingUpper;
+ public Vector3 Angles;
+ public int LastOffset;
+ public int LastDistance;
+ public Box HotPoint;
+
+ public Vector3 BoundingPos
+ {
+  get
+  {
+   return new Vector3(
+    (int)((BoundingUpper.x + BoundingLower.x)) / 2,
+    (int)((BoundingUpper.y + BoundingLower.y)) / 2,
+    (int)((BoundingUpper.z + BoundingLower.z)) / 2
+   );
+  }
+ }
+
+ public Vector3 BoundingSize
+ {
+  get
+  {
+   return new Vector3(
+    (BoundingUpper.x - BoundingLower.x),
+    (BoundingUpper.y - BoundingLower.y),
+    (BoundingUpper.z - BoundingLower.z)
+   );
+  }
+ }
+
+ public bool HighLight
+ {
+  set
+  {
+   highlighted = value;
+   RefreshMaterial();
+  }
+ }
+
+ public byte Alpha
+ {
+  set
+  {
+   color = new Color32(color.r, color.g, color.b, value);
+   RefreshMaterial();
+  }
+ }
+
+ public bool AlwaysOnTop
+ {
+  set
+  {
+   alwaysOnTop = value;
+   RefreshMaterial();
+  }
+ }
+
+ public Color32 Color
+ {
+  set
+  {
+   color = value;
+   RefreshMaterial();
+  }
+ }
+
+ private void RefreshMaterial()
+ {
+  Color32 materialColor = color;
+
+  if (highlighted)
+  {
+   if (materialColor.a == 255)
+   {
+    materialColor = new Color32((byte)(Math.Min(materialColor.r + 75, 255)),
+     (byte)(Math.Min(materialColor.g + 75, 255)),
+     (byte)(Math.Min(materialColor.b + 75, 255)),
+     materialColor.a);
+   }
+   else
+   {
+    materialColor = new Color32(materialColor.r, materialColor.g, materialColor.b, (byte)(Math.Min(materialColor.a + 100, 255)));
+   }
+  }
+
+  if (alwaysOnTop)
+  {
+   materialColor = new Color32(materialColor.r, materialColor.g, materialColor.b, 254);
+  }
+
+  Renderer renderer = this.GetComponent<Renderer>();
+  if ((renderer.sharedMaterial == null || renderer.sharedMaterial.color != materialColor))
+  {
+   renderer.sharedMaterial = GetComponent<MaterialCache>().GetMaterialFromCache(materialColor);
+  }
+ }
+
+ public void UpdateText(BoxInfo info, uint timer)
+ {
+  info.Clear();
+  info.Append("TYPE", name.ToUpperInvariant());
+  info.Append("ID", ID);
+  if (name == "Collider" || name == "Trigger" || name == "Actor")
+  {
+   info.Append("FLAGS", "0x{0:X4}", Flags);
+  }
+
+  if (name == "Actor")
+  {
+   info.Append("COL_FLAGS", "0x{0:X4}", ColFlags);
+
+   if (ShowAdditionalInfo)
+   {
+    info.Append("ROOM", "E{0}R{1}", Floor, Room);
+    info.Append("ROOM_POS", LocalPosition);
+    info.Append("WORLD_POS", WorldPosition);
+    info.Append("ZV_POS", BoundingPos);
+    info.Append("ZV_SIZE", BoundingSize);
+    info.Append("OFFSET", LastOffset);
+    info.Append("DISTANCE", LastDistance);
+    info.Append("ANGLE", "{0:N1} {1:N1} {2:N1}",
+     Angles.x * 360.0f / 1024.0f,
+     Angles.y * 360.0f / 1024.0f,
+     Angles.z * 360.0f / 1024.0f);
+   }
+
+   if (Life != -1)
+    info.Append("LIFE", Life);
+   if (LifeMode != -1)
+    info.Append("LIFEMODE", LifeMode);
+
+   if (Body != -1)
+   {
+    if(Anim != -1)
+    {
+     if(NextAnim != -1)
+      info.Append("BODY/ANIM", "{0}; {1}; {2}", Body, Anim, NextAnim);
+     else
+      info.Append("BODY/ANIM", "{0}; {1}", Body, Anim);
+
+     if (AnimType >= 0 && AnimType <= 2)
+     {
+      info.Append("ANIMTYPE", animTypeInfo[AnimType]);
+     }
+    }
+    else
+     info.Append("BODY", Body);
+   }
+
+   if (Anim != -1)
+   {
+    if (Keyframe != -1)
+    {
+     info.Append("KEYFRAME", "{0}/{1}", Keyframe, TotalFrames - 1);
+     if (ShowAdditionalInfo)
+     {    
+      info.Append("SUB_KEYFRAME", Mathf.FloorToInt(lastKeyFrameChange.Elapsed * 60.0f));
+     }
+    }
+    if (ShowAdditionalInfo)
+    {
+     info.Append("SPEED", Speed);
+    }
+   }
+
+   if (ShowAdditionalInfo)
+   {
+    if (Chrono != 0)
+     info.Append("CHRONO", TimeSpan.FromSeconds((timer - Chrono) / 60));
+    if (RoomChrono != 0)
+     info.Append("ROOM_CHRONO", TimeSpan.FromSeconds((timer - RoomChrono) / 60));
+    if (TrackMode != -1)
+     info.Append("TRACKMODE", TrackMode);
+    if (TrackNumber != -1)
+     info.Append("TRACKNUMBER", TrackNumber);
+    if (PositionInTrack != -1)
+     info.Append("TRACKPOSITION", PositionInTrack);
+    info.Append("SLOT", Slot);
+   }
+  }
+
+  info.UpdateText();
+ }
+}
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+
+public class BoxComparer : IComparer<RaycastHit>
+{
+ public int Room { get; set; }
+
+ public int Compare(RaycastHit a, RaycastHit b)
+ {
+  Box boxA = a.collider.GetComponent<Box>();
+  Box boxB = b.collider.GetComponent<Box>();
+
+  //actors have priority over the rest
+  int isActorA = boxA.name == "Actor" ? 0 : 1;
+  int isActorB = boxB.name == "Actor" ? 0 : 1;
+  if (isActorA != isActorB)
+  {
+   return isActorA.CompareTo(isActorB);
+  }
+
+  // check distance
+  if (Mathf.Abs(a.distance - b.distance) >= 0.0005f)
+  {
+   return a.distance.CompareTo(b.distance);
+  }
+
+  //if objects are too close each other, check current room
+  int aCurrentRoom = boxA.Room == Room ? 0 : 1;
+  int bCurrentRoom = boxB.Room == Room ? 0 : 1;
+  if (aCurrentRoom != bCurrentRoom)
+  {
+   return aCurrentRoom.CompareTo(bCurrentRoom);
+  }
+
+  if (boxA.name == "Camera" && boxB.name == "Camera")
+  {
+   return -boxA.GetComponent<Renderer>().sharedMaterial.renderQueue
+    .CompareTo(boxB.GetComponent<Renderer>().sharedMaterial.renderQueue);
+  }
+
+  return 0;
+ }
+}
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using UnityEngine;
+using UnityEngine.UI;
+
+public class BoxInfo : MonoBehaviour
+{
+ public Text LeftText;
+ public Text RightText;
+
+ readonly StringBuilder names = new StringBuilder();
+ readonly StringBuilder values = new StringBuilder();
+
+ public void Clear(bool hide = false)
+ {
+  names.Length = 0;
+  values.Length = 0;
+
+  if (hide)
+  {
+   LeftText.text = string.Empty;
+   RightText.text = string.Empty;
+   gameObject.SetActive(false);
+  }
+ }
+
+ public void Append()
+ {
+  AppendLineIfNecessary(); 
+ }
+
+ public void Append(string name, Vector3 value)
+ {
+  AppendLineIfNecessary();
+  names.Append(name);
+  values.Append(value.x);
+  values.Append(' ');
+  values.Append(value.y);
+  values.Append(' ');
+  values.Append(value.z);
+ }
+
+ public void Append<T>(string name, T value)
+ {
+  AppendLineIfNecessary();
+  names.Append(name);
+  values.Append(value.ToString());
+ }
+
+ public void Append(string name, string format, params object[] args)
+ {
+  AppendLineIfNecessary();
+  names.Append(name);
+  values.AppendFormat(format, args);
+ }
+
+ private void AppendLineIfNecessary()
+ {
+  if (names.Length > 0) names.AppendLine();
+  if (values.Length > 0) values.AppendLine();
+ }
+
+ public void UpdateText()
+ {
+  gameObject.SetActive(names.Length > 0);
+  LeftText.text = names.ToString(); 
+  RightText.text = values.ToString(); 
+ }
+}
+
+using System;
+using UnityEngine;
+using System.Collections.Generic;
+
+public class MaterialCache : MonoBehaviour
+{
+ private static Dictionary<Color32, Material> materialsCache = new Dictionary<Color32, Material>();
+ public Material TransparentMaterial;
+ public Material OpaqueMaterial;
+ public Material AlwaysOnTopMaterial;
+
+ public Material GetMaterialFromCache(Color32 color)
+ {
+  Material material;
+  if (!materialsCache.TryGetValue(color, out material))
+  {
+   if (color.a == 254)
+   {
+    material = new Material(AlwaysOnTopMaterial);
+   }
+   else if (color.a == 255)
+   {
+    material = new Material(OpaqueMaterial);
+   }
+   else
+   {
+    material = new Material(TransparentMaterial);
+   }
+
+   material.color = color;
+   materialsCache.Add(color, material);
+  }
+
+  return material;
+ }
+}
+using UnityEngine;
+using System.Collections;
+using System;
+using System.Linq;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+using UnityEngine.UI;
+using UnityEngine.EventSystems;
+using UnityEngine.SceneManagement;
+
+public class RoomLoader : MonoBehaviour
+{
+ private int floor = 0;
+ private int room = 0;
+ private int[] cameraColors = new [] { 0xFF8080, 0x789CF0, 0xB0DE6F, 0xCC66C0, 0x5DBAAB, 0xF2BA79, 0x8E71E3, 0x6ED169, 0xBF6080, 0x7CCAF7 };
+ private Vector3 mousePosition;
+ private KeyCode[] keyCodes = Enum.GetValues(typeof(KeyCode)).Cast<KeyCode>().ToArray();
+ private List<int> floors = new List<int>();
+ private BoxComparer boxComparer = new BoxComparer();
+ private float defaultCameraZoom = 10.0f;
+ private Timer defaultBoxSelectionTimer = new Timer();
+ private bool speedRunMode;
+
+ public Text LeftText;
+ public BoxInfo BottomText;
+ public Box BoxPrefab;
+
+ public BoxInfo BoxInfo;
+ private Box HighLightedBox;
+ private Box SelectedBox;
+ private int SelectedBoxId;
+
+ private bool DosBoxEnabled;
+ public bool IsCDROMVersion;
+ public GameObject Actors;
+
+ public RectTransform Panel;
+ public Button ShowVars;
+ public ToggleButton LinkToDOSBox;
+ public ToggleButton ShowAdditionalInfo;
+ public ToggleButton ShowActors;
+ public Slider CameraRotation;
+ public ToggleButton ShowTriggers;
+ public ToggleButton ShowRooms;
+ public ToggleButton ShowAreas;
+ public ToggleButton CameraFollow;
+ public ToggleButton CameraMode;
+
+ void Start()
+ {
+  Directory.CreateDirectory("GAMEDATA");
+
+  //check existing ETAGEXX folders
+  floors = Directory.GetDirectories("GAMEDATA")
+   .Select(x => Path.GetFileName(x))
+   .Where(x => x.StartsWith("ETAGE", StringComparison.InvariantCultureIgnoreCase))
+   .Select(x => int.Parse(x.Substring(5, 2)))
+   .ToList();
+  floor = floors.FirstOrDefault();
+
+  CheckCommandLine();
+  if (floors.Count > 0)
+  {
+   RefreshRooms();
+  }
+  ToggleMenuDOSBoxOptions(false);
+ }
+
+ void RefreshRooms()
+ {
+  LeftText.text = string.Format("E{0}R{1}", floor, room);
+
+  //load new floor only if needed
+  if (name != "FLOOR" + floor)
+  {
+   RemoveAll();
+   LoadFloor(floor);
+  }
+
+  SetRoomObjectsVisibility(room);
+
+  if (CameraFollow.Value == 1) //room
+  {
+   CenterCamera(room);
+  }
+ }
+
+ void CenterCamera(int room)
+ {
+  if (transform.childCount > 0)
+  {
+   Transform roomTransform = transform.Find("ROOM" + room);
+   if (roomTransform != null)
+   {
+    Vector3 roomPosition = roomTransform.localPosition;
+    Camera.main.transform.position = new Vector3(roomPosition.x, Camera.main.transform.position.y, roomPosition.z);
+   }
+  }
+ }
+
+ void SetRoomObjectsVisibility(int room)
+ {
+  bool showallrooms = ShowRooms.Value == 3 || ShowRooms.Value == 2;
+  bool showallroomstransparent = ShowRooms.Value == 2;
+  bool showcolliders = ShowRooms.Value != 0;
+  bool showtiggers = ShowTriggers.BoolValue;
+
+  int roomIndex = 0;
+  foreach (Transform roomTransform in transform.Cast<Transform>().Where(x => x.name != "DELETED"))
+  {
+   bool currentRoom = room == roomIndex;
+   //roomTransform.gameObject.SetActive(showallrooms || currentRoom);
+   foreach (Box box in roomTransform.GetComponentsInChildren<Box>(true))
+   {
+    if (box.name == "Trigger")
+    {
+     box.gameObject.SetActive(showtiggers && currentRoom);
+    }
+
+    if (box.name == "Camera")
+    {
+     box.gameObject.SetActive(ShowAreas.Value == 2 || (ShowAreas.Value == 1 && currentRoom));
+    }
+
+    if (box.name == "Collider")
+    {
+     box.gameObject.SetActive(showcolliders && (showallrooms || currentRoom));
+     box.Alpha = (byte)((showallroomstransparent && !currentRoom) ? 40 : 255);
+    }
+   }
+   roomIndex++;
+  }
+ }
+
+ void LoadFloor(int floor)
+ {
+  //check folder
+  string folder = string.Format("GAMEDATA\\ETAGE{0:D2}", floor);
+  if (!Directory.Exists(folder))
+  {
+   LeftText.text = string.Format("Cannot find folder {0}", folder);
+   return;
+  }
+
+  //load file
+  string filePath = Directory.GetFiles(folder).FirstOrDefault(x => Path.GetFileNameWithoutExtension(x) == "00000000");
+  byte[] allPointsA = File.ReadAllBytes(filePath);
+  List<List<int>> camerasPerRoom = new List<List<int>>();
+
+  name = "FLOOR" + floor;
+  int maxrooms = Utils.ReadInt(allPointsA, 0) / 4;
+  for (int currentroom = 0; currentroom < maxrooms; currentroom++)
+  {
+   int i = currentroom * 4;
+   int roomheader = Utils.ReadInt(allPointsA, i + 0);
+   if (roomheader > allPointsA.Length || roomheader == 0)
+   {
+    //all rooms parsed
+    break;
+   }
+
+   //room
+   GameObject roomObject = new GameObject();
+   roomObject.name = "ROOM" + currentroom;
+   roomObject.transform.parent = transform;
+
+   int roomx = Utils.ReadShort(allPointsA, roomheader + 4);
+   int roomy = Utils.ReadShort(allPointsA, roomheader + 6);
+   int roomz = Utils.ReadShort(allPointsA, roomheader + 8);
+
+   roomObject.transform.localPosition = new Vector3(roomx, roomy, -roomz) / 100.0f;
+
+   //colliders
+   i = roomheader + Utils.ReadShort(allPointsA, roomheader + 0);
+   int totalpoint = Utils.ReadShort(allPointsA, i + 0);
+   i += 2;
+
+   for (int count = 0; count < totalpoint; count++)
+   {
+    Box box = Instantiate(BoxPrefab);
+    box.name = "Collider";
+    box.Room = currentroom;
+    box.transform.parent = roomObject.transform;
+
+    box.transform.localPosition = new Vector3((Utils.ReadShort(allPointsA, i + 0) + Utils.ReadShort(allPointsA, i + 2)),
+     -(Utils.ReadShort(allPointsA, i + 4) + Utils.ReadShort(allPointsA, i + 6)),
+     (Utils.ReadShort(allPointsA, i + 8) + Utils.ReadShort(allPointsA, i + 10))) / 2000.0f;
+
+    box.transform.localScale = new Vector3((Utils.ReadShort(allPointsA, i + 2) - Utils.ReadShort(allPointsA, i + 0)),
+     (Utils.ReadShort(allPointsA, i + 6) - Utils.ReadShort(allPointsA, i + 4)),
+     (Utils.ReadShort(allPointsA, i + 10) - Utils.ReadShort(allPointsA, i + 8))) / 1000.0f;
+
+    box.ID = Utils.ReadShort(allPointsA, i + 12);
+    box.Flags = Utils.ReadShort(allPointsA, i + 14);
+
+    box.Color = new Color32(143, 143, 143, 255);
+    if ((box.Flags & 2) == 2)
+    {
+     //underground floor
+     box.Color = new Color32(100, 100, 100, 255);
+    }
+    if ((box.Flags & 8) == 8)
+    {
+     //interactive box
+     box.Color = new Color32(0, 0, 128, 255);
+    }
+
+    i += 16;
+   }
+
+   //triggers
+   i = roomheader + Utils.ReadShort(allPointsA, roomheader + 2);
+   totalpoint = Utils.ReadShort(allPointsA, i + 0);
+   i += 2;
+
+   for (int count = 0; count < totalpoint; count++)
+   {
+
+    Box box = Instantiate(BoxPrefab);
+    box.name = "Trigger";
+    box.Room = currentroom;
+    box.transform.parent = roomObject.transform;
+
+    box.transform.localPosition = new Vector3((Utils.ReadShort(allPointsA, i + 0) + Utils.ReadShort(allPointsA, i + 2)),
+     -(Utils.ReadShort(allPointsA, i + 4) + Utils.ReadShort(allPointsA, i + 6)),
+     (Utils.ReadShort(allPointsA, i + 8) + Utils.ReadShort(allPointsA, i + 10))) / 2000.0f;
+
+    box.transform.localScale = new Vector3((Utils.ReadShort(allPointsA, i + 2) - Utils.ReadShort(allPointsA, i + 0)),
+     (Utils.ReadShort(allPointsA, i + 6) - Utils.ReadShort(allPointsA, i + 4)),
+     (Utils.ReadShort(allPointsA, i + 10) - Utils.ReadShort(allPointsA, i + 8))) / 1000.0f;
+
+    box.ID = Utils.ReadShort(allPointsA, i + 12);
+    box.Flags = Utils.ReadShort(allPointsA, i + 14);
+
+    if (box.Flags == 9) //custom trigger
+    {
+     box.Color = new Color32(255, 128, 0, 50);
+    }
+    else if (box.Flags == 10) //exit
+    {
+     box.Color = new Color32(255, 255, 50, 100);
+    }
+    else if (box.Flags == 0) //room switch
+    {
+     box.Color = new Color32(255, 0, 0, 45);
+    }
+    else
+    {
+     box.Color = new Color32(255, 128, 128, 50);
+    }
+
+    i += 16;
+   }
+
+   //cameras
+   int cameraCount = Utils.ReadShort(allPointsA, roomheader + 10);
+   List<int> cameraInRoom = new List<int>();
+   for (int cameraIndex = 0; cameraIndex < cameraCount; cameraIndex++)
+   {
+    int cameraID = Utils.ReadShort(allPointsA, roomheader + cameraIndex * 2 + 12);  //camera
+    cameraInRoom.Add(cameraID);
+   }
+
+   camerasPerRoom.Add(cameraInRoom);
+  }
+
+  //cameras
+  bool isAITD1 = DetectGame() == 1;
+  filePath = Directory.GetFiles(folder).FirstOrDefault(x => Path.GetFileNameWithoutExtension(x) == "00000001");
+  byte[] allPointsB = File.ReadAllBytes(filePath);
+  int roomIndex = 0;
+  List<Transform> rooms = transform.Cast<Transform>().Where(x => x.name != "DELETED").ToList();
+  foreach (Transform room in rooms)
+  {
+   foreach (int cameraID in camerasPerRoom[roomIndex])
+   {
+    int cameraHeader = Utils.ReadShort(allPointsB, cameraID * 4 + 0);
+    int numentries = Utils.ReadShort(allPointsB, cameraHeader + 0x12);
+
+    List<Vector2> points = new List<Vector2>();
+    List<int> indices = new List<int>();
+
+    for (int k = 0; k < numentries; k++)
+    {
+     int i = cameraHeader + 0x14 + k * (isAITD1 ? 12 : 16);
+     int cameraRoom = Utils.ReadShort(allPointsB, i + 0);
+
+     if (cameraRoom == roomIndex)
+     {
+      i = cameraHeader + Utils.ReadShort(allPointsB, i + 4);
+      int totalAreas = Utils.ReadShort(allPointsB, i + 0);
+      i += 2;
+
+      for (int g = 0; g < totalAreas; g++)
+      {
+       int totalPoints = Utils.ReadShort(allPointsB, i + 0);
+       i += 2;
+
+       List<Vector2> pts = new List<Vector2>();
+       for (int u = 0; u < totalPoints; u++)
+       {
+        short px = Utils.ReadShort(allPointsB, i + 0);
+        short pz = Utils.ReadShort(allPointsB, i + 2);
+        pts.Add(new Vector2(px, pz) / 100.0f);
+        i += 4;
+       }
+
+       Triangulator tr = new Triangulator(pts);
+       int[] idc = tr.Triangulate();
+       indices.AddRange(idc.Select(x => x + points.Count).ToArray());
+       points.AddRange(pts);
+      }
+     }
+    }
+
+    if (points.Count > 0)
+    {
+     int colorRGB = cameraColors[cameraID % cameraColors.Length];
+
+     Box box = Instantiate(BoxPrefab);
+     box.name = "Camera";
+     box.transform.parent = room;
+     box.transform.localPosition = Vector3.zero;
+     box.Color = new Color32((byte)((colorRGB >> 16) & 0xFF), (byte)((colorRGB >> 8) & 0xFF), (byte)(colorRGB & 0xFF), 100);
+     box.ID = cameraID;
+     MeshFilter filter = box.GetComponent<MeshFilter>();
+
+     // Use the triangulator to get indices for creating triangles
+     filter.sharedMesh = GetMeshFromPoints(points, indices);
+     Destroy(box.gameObject.GetComponent<BoxCollider>());
+     box.gameObject.AddComponent<MeshCollider>();
+    }
+   }
+
+   roomIndex++;
+  }
+ }
+
+ void RemoveAll()
+ {
+  name = "DELETED";
+  foreach (Transform t in transform)
+  {
+   t.name = "DELETED"; //bug fix
+   Destroy(t.gameObject);
+  }
+ }
+
+ public int DetectGame()
+ {
+  //detect game based on number of floors
+  if (floors.Count >= 15)
+   return 2;
+  else if (floors.Count >= 14)
+   return 3;
+  else
+   return 1;
+ }
+
+ void Update()
+ {
+  float mouseWheel = Input.GetAxis("Mouse ScrollWheel");
+  if (mouseWheel > 0.0f)
+  {
+   if (Camera.main.orthographic)
+   {
+    Camera.main.orthographicSize *= 0.9f;
+   }
+   else
+   {
+    Camera.main.transform.position = Vector3.Scale(Camera.main.transform.position, new Vector3(1.0f, 0.9f, 1.0f));
+   }
+
+  }
+  else if (mouseWheel < 0.0f)
+  {
+   if (Camera.main.orthographic)
+   {
+    Camera.main.orthographicSize *= 1.0f / 0.9f;
+   }
+   else
+   {
+    Camera.main.transform.position = Vector3.Scale(Camera.main.transform.position, new Vector3(1.0f, 1.0f / 0.9f, 1.0f));
+   }
+  }
+
+  if (!menuEnabled && !GetComponent<WarpDialog>().warpMenuEnabled)
+  {
+   //start drag
+   if (Input.GetMouseButtonDown(0))
+   {
+    mousePosition = Input.mousePosition;
+   }
+
+   //dragging
+   if (Input.GetMouseButton(0))
+   {
+    Vector3 newMousePosition = Input.mousePosition;
+    if (newMousePosition != this.mousePosition)
+    {
+     Vector3 cameraHeight = new Vector3(0.0f, 0.0f, Camera.main.transform.position.y);
+     Vector3 mouseDelta = Camera.main.ScreenToWorldPoint(this.mousePosition + cameraHeight)
+           - Camera.main.ScreenToWorldPoint(newMousePosition + cameraHeight);
+
+     Camera.main.transform.position += mouseDelta;
+     mousePosition = newMousePosition;
+    }
+   }
+  }
+
+  //menu
+  if (Input.GetMouseButtonDown(1))
+  {
+   WarpDialog warpDialog = GetComponent<WarpDialog>();
+   if(menuEnabled)
+   {
+    menuEnabled = false;
+   }
+   else if(warpDialog.warpMenuEnabled)
+   {
+    warpDialog.warpMenuEnabled = false;
+    if(speedRunMode)
+    {
+     warpDialog.warpActor = null; //reset to player
+    }
+   }
+   else if (DosBoxEnabled && HighLightedBox != null && HighLightedBox.name == "Actor")
+   {
+    warpDialog.LoadActor(HighLightedBox);
+    warpDialog.warpMenuEnabled = true;
+   }
+   else if (!GetComponent<Vars>().enabled)
+   {
+    menuEnabled = true;
+   }
+  }
+
+  if (Input.GetMouseButtonUp(0)
+   && !RectTransformUtility.RectangleContainsScreenPoint(Panel, Input.mousePosition))
+  {
+   menuEnabled = false;
+  }
+
+  if (menuEnabled != Panel.gameObject.activeSelf)
+  {
+   Panel.gameObject.SetActive(menuEnabled);
+  }
+
+  GetComponent<DosBox>().CalculateFPS();
+  GetComponent<DosBox>().UpdateAllActors();
+  GetComponent<DosBox>().UpdateBoxInfo();
+  RefreshHighLightedBox();
+  RefreshSelectedBox();
+
+  //process keys
+  if (!GetComponent<WarpDialog>().warpMenuEnabled)
+  {
+   foreach (var key in keyCodes)
+   {
+    if (Input.GetKeyDown(key))
+    {
+     ProcessKey(key);
+    }
+   }
+  }
+ }
+
+ private void RefreshHighLightedBox()
+ {
+  Vector3 mousePosition = Input.mousePosition;
+  RaycastHit[] hitInfos = null;
+
+  //check screen boundaries
+  if (mousePosition.x > 0 && mousePosition.x < Screen.width &&
+   mousePosition.y > 0 && mousePosition.y < Screen.height)
+  {
+   hitInfos = Physics.RaycastAll(Camera.main.ScreenPointToRay(mousePosition));
+  }
+
+  if (hitInfos != null && hitInfos.Length > 0 
+   && !menuEnabled && !GetComponent<WarpDialog>().warpMenuEnabled)
+  {
+   //sort colliders by priority
+   boxComparer.Room = room;
+   Array.Sort(hitInfos, boxComparer);
+
+   Box box = hitInfos[0].collider.GetComponent<Box>();
+   if (box != HighLightedBox)
+   {
+    if (HighLightedBox != null)
+    {
+     HighLightedBox.HighLight = false;
+     if(HighLightedBox.name == "Camera")
+     {
+      HighLightedBox.GetComponent<Renderer>().sharedMaterial.renderQueue = 3000;
+     }
+    }
+
+    box.HighLight = true;
+
+    if(box.name == "Camera")
+    {
+     box.GetComponent<Renderer>().sharedMaterial.renderQueue = 3500;
+    }
+
+    HighLightedBox = box;
+   }
+
+   //display info
+   Vector3 position = Camera.main.WorldToScreenPoint(box.GetComponent<Renderer>().bounds.center);
+   BoxInfo.transform.position = new Vector3(position.x, position.y, 0.0f);
+
+   //text
+   box.UpdateText(BoxInfo, GetComponent<DosBox>().InternalTimer);
+  }
+  else if (HighLightedBox != null)
+  {
+   HighLightedBox.HighLight = false;
+   HighLightedBox = null;
+   BoxInfo.Clear(true);
+  }
+ }
+
+ private void RefreshSelectedBox()
+ {
+  //toggle selected box
+  if (Input.GetMouseButtonDown(0) && HighLightedBox != null
+   && !(GetComponent<WarpDialog>().warpMenuEnabled  //make sure it not possible to change actor when there is a click inside warp menu
+    && RectTransformUtility.RectangleContainsScreenPoint(GetComponent<WarpDialog>().Panel, Input.mousePosition)))
+  {
+   if (SelectedBox != HighLightedBox)
+   {
+    SelectedBox = HighLightedBox;
+    SelectedBoxId = HighLightedBox.ID;
+   }
+   else
+   {
+    SelectedBox = null;
+    defaultBoxSelectionTimer.Restart();
+   }
+  }
+
+  if (!DosBoxEnabled)
+  {
+   SelectedBox = null;
+  }
+
+  if (SelectedBox != null)
+  {
+   if (SelectedBox.ID == SelectedBoxId)
+   {
+    //display selected box info
+    SelectedBox.UpdateText(BottomText, GetComponent<DosBox>().InternalTimer);
+   }
+   else
+   {
+    //if actor is no more available (eg : after room switch) search for it
+    foreach (Box box in Actors.GetComponentsInChildren<Box>(true))
+    {
+     if (box.ID == SelectedBoxId)
+     {
+      SelectedBox = box;
+      break;
+     }
+    }
+   }
+  }
+  else
+  {
+   BottomText.Clear(true);
+
+   if(speedRunMode && defaultBoxSelectionTimer.Elapsed > 1.0f)
+   {
+    //select player by default
+    SelectedBox = GetComponent<DosBox>().Player;
+    if (SelectedBox != null)
+    {
+     SelectedBoxId = SelectedBox.ID;
+    }
+   }
+  }
+ }
+
+ #region DOSBOX
+
+ public void RefreshRooms(int newfloor, int newroom)
+ {
+  if (CameraFollow.Value == 1 || CameraFollow.Value == 2) //room or player
+  {
+   if (floors.Contains(newfloor))
+   {
+    floor = newfloor;
+    room = newroom;
+    RefreshRooms();
+   }
+  }
+ }
+
+ public Transform GetRoom(int newfloor, int newroom)
+ {
+  if (floor == newfloor && newroom >= 0 && newroom < transform.childCount)
+  {
+   return transform.GetChild(newroom);
+  }
+  return null;
+ }
+
+ public void CenterCamera(Vector2 position)
+ {
+  if (CameraFollow.Value == 2) //follow player
+  {
+   Camera.main.transform.position = new Vector3(position.x, Camera.main.transform.position.y, position.y);
+  }
+ }
+
+ public Box GetSelectedBox()
+ {
+  return SelectedBox;
+ }
+
+ #endregion
+
+ #region GUI
+
+ private bool menuEnabled;
+
+ public void SetCameraRotation(Slider slider)
+ {
+  Camera.main.transform.rotation = Quaternion.Euler(90.0f, 0.0f, slider.value * 22.5f);
+ }
+
+ private void ToggleMenuDOSBoxOptions(bool enabled)
+ {
+  bool isAITD1 = DetectGame() == 1;
+  ShowActors.transform.parent.gameObject.SetActive(enabled);
+  ShowAdditionalInfo.transform.parent.gameObject.SetActive(enabled && isAITD1 && IsCDROMVersion);
+  ShowVars.transform.gameObject.SetActive(enabled && isAITD1);
+  Panel.sizeDelta = new Vector2(Panel.sizeDelta.x, Panel.Cast<Transform>().Count(x => x.gameObject.activeSelf) * 30.0f);
+ }
+
+ public void ProcessKey(string keyCode)
+ {
+  KeyCode keyCodeEnum = (KeyCode)Enum.Parse(typeof(KeyCode), keyCode, true);
+  ProcessKey(keyCodeEnum);
+ }
+
+ public void ProcessKey(KeyCode keyCode)
+ {
+  switch (keyCode)
+  {
+   case KeyCode.L:
+    if (!DosBoxEnabled)
+    {
+     DosBoxEnabled = (GetComponent<DosBox>().LinkToDosBOX(floor, room));
+
+     //set follow mode to player
+     CameraFollow.Value = 2;
+     GetComponent<DosBox>().ResetCamera(floor, room);
+     GetComponent<DosBox>().ShowAdditionalInfo = DosBoxEnabled && ShowAdditionalInfo.BoolValue && IsCDROMVersion && DetectGame() == 1;
+
+     Actors.SetActive(DosBoxEnabled && ShowActors.BoolValue);
+
+     //select player by default
+     if (SelectedBox == null)
+     {
+      GetComponent<DosBox>().UpdateAllActors();
+      SelectedBox = GetComponent<DosBox>().Player;
+      if (SelectedBox != null)
+      {
+       SelectedBoxId = SelectedBox.ID;
+      }
+     }
+    }
+    else
+    {
+     //follow player => room
+     if (CameraFollow.Value == 2)
+     {
+      CameraFollow.Value = 1;
+     }
+     GetComponent<DosBox>().UnlinkDosBox();
+
+     Actors.SetActive(false);
+     DosBoxEnabled = false;
+
+     GetComponent<Vars>().enabled = false; //hide vars
+     GetComponent<WarpDialog>().warpMenuEnabled = false; //hide warp
+     GetComponent<DosBox>().ShowAdditionalInfo = false;
+    }
+    LinkToDOSBox.BoolValue = DosBoxEnabled;
+    ToggleMenuDOSBoxOptions(DosBoxEnabled);
+    menuEnabled = false; //hide menu
+    break;
+
+   case KeyCode.Tab:
+    SceneManager.LoadScene("model");
+    break;
+
+   case KeyCode.D:
+    Camera.main.orthographic = !Camera.main.orthographic;
+    CameraMode.BoolValue = Camera.main.orthographic;
+    float planeSize = Mathf.Tan(Camera.main.fieldOfView * Mathf.Deg2Rad / 2.0f);
+
+    if (Camera.main.orthographic)
+    {
+     Camera.main.orthographicSize = Camera.main.transform.position.y * planeSize;
+     Camera.main.transform.position = new Vector3(Camera.main.transform.position.x, 20.0f, Camera.main.transform.position.z);
+    }
+    else
+    {
+     Camera.main.transform.position = new Vector3(
+      Camera.main.transform.position.x,
+      Camera.main.orthographicSize / planeSize,
+      Camera.main.transform.position.z);
+    }
+    break;
+
+   case KeyCode.F:
+    CameraFollow.Value = (CameraFollow.Value + 1) % (!DosBoxEnabled ? 2 : 3);
+    if (CameraFollow.Value == 1) //room
+    {
+     CenterCamera(room);
+    }
+    else if (CameraFollow.Value == 2) //player
+    {
+     //make sure camear snap back
+     GetComponent<DosBox>().ResetCamera(floor, room);
+    }
+    break;
+
+   case KeyCode.V:
+    if (DetectGame() == 1 && DosBoxEnabled)
+    {
+     GetComponent<Vars>().enabled = !GetComponent<Vars>().enabled;
+     menuEnabled = false;
+    }
+    break;
+
+   case KeyCode.R:
+    ShowRooms.Value = (ShowRooms.Value + 1) % 4;
+    SetRoomObjectsVisibility(room);
+    break;
+
+   case KeyCode.C:
+    ShowAreas.Value = (ShowAreas.Value + 1) % 3;
+    SetRoomObjectsVisibility(room);
+    break;
+
+   case KeyCode.T:
+    ShowTriggers.BoolValue = !ShowTriggers.BoolValue;
+    SetRoomObjectsVisibility(room);
+    break;
+
+   case KeyCode.A:
+    ShowActors.BoolValue = !ShowActors.BoolValue;
+    Actors.SetActive(DosBoxEnabled && ShowActors.BoolValue);
+    break;
+
+   case KeyCode.E:
+    if (DetectGame() == 1)
+    {
+     ShowAdditionalInfo.BoolValue = !ShowAdditionalInfo.BoolValue;
+     GetComponent<DosBox>().ShowAdditionalInfo = DosBoxEnabled && IsCDROMVersion && ShowAdditionalInfo.BoolValue;
+    }
+    break;
+
+   case KeyCode.Mouse2:
+    //reset zoom
+    Vector3 pos = Camera.main.transform.position;
+    Camera.main.transform.position = new Vector3(pos.x, defaultCameraZoom, pos.z);
+    float planeWidth = Mathf.Tan(Camera.main.fieldOfView * Mathf.Deg2Rad / 2.0f);
+    Camera.main.orthographicSize = defaultCameraZoom * planeWidth;
+    break;
+
+   case KeyCode.Escape:
+    if (Screen.fullScreen)
+     Application.Quit();
+    break;
+
+   case KeyCode.PageUp:
+    CameraRotation.value = Math.Min(CameraRotation.value + 1, 8);
+    break;
+
+   case KeyCode.PageDown:
+    CameraRotation.value = Math.Max(CameraRotation.value - 1, -8);
+    break;
+
+   case KeyCode.DownArrow:
+    //skip missing floors
+    int index = floors.IndexOf(floor);
+    if (index > 0)
+    {
+     index--;
+     floor = floors[index];
+     room = 0;
+     RefreshRooms();
+    }
+    break;
+
+   case KeyCode.UpArrow:
+    //skip missing floors
+    int idx = floors.IndexOf(floor);
+    if (idx < floors.Count - 1)
+    {
+     idx++;
+     floor = floors[idx];
+     room = 0;
+     RefreshRooms();
+    }
+    break;
+
+   case KeyCode.LeftArrow:
+    if (room > 0)
+    {
+     room--;
+     RefreshRooms();
+    }
+    break;
+
+   case KeyCode.RightArrow:
+    int roomsCount = transform.Cast<Transform>().Where(x => x.name != "DELETED").Count();
+    if (room < roomsCount - 1)
+    {
+     room++;
+     RefreshRooms();
+    }
+    break;
+  }
+ }
+
+ #endregion
+
+ void CheckCommandLine()
+ {
+  var args = System.Environment.GetCommandLineArgs();
+  if (args.Contains("-speedrun", StringComparer.InvariantCultureIgnoreCase))
+  {
+   speedRunMode = true;
+   defaultCameraZoom = 10.0f / Mathf.Pow(0.9f, 5.0f);
+   ProcessKey(KeyCode.Mouse2); //reset camera zoom
+   ProcessKey(KeyCode.D); //camera perspective
+   ProcessKey(KeyCode.C); //camera areas for current room
+   ProcessKey(KeyCode.E); //extra info
+  }
+ }
+
+ Mesh GetMeshFromPoints(List<Vector2> vertices2D, List<int> indices)
+ {
+  // Create the Vector3 vertices
+  Vector3[] vertices = new Vector3[vertices2D.Count];
+  for (int i = 0; i < vertices.Length; i++)
+  {
+   vertices[i] = new Vector3(vertices2D[i].x, 0, vertices2D[i].y);
+  }
+
+  // Create the mesh
+  Mesh msh = new Mesh();
+  msh.vertices = vertices;
+  msh.triangles = indices.ToArray();
+  msh.RecalculateNormals();
+  msh.RecalculateBounds();
+
+  return msh;
+
+ }
+}
+using System;
+using UnityEngine;
+
+public class Timer
+{
+ private float started;
+ private bool running;
+ private float elapsed;
+
+ public void Start()
+ {
+  if (!running)
+  {
+   started = Time.time;
+   running = true;
+  }
+ }
+  
+ public void Stop()
+ {
+  if (running)
+  {
+   elapsed += Time.time - started;
+   running = false;
+  }
+ }
+
+ public void Restart()
+ {
+  elapsed = 0;
+  started = Time.time;
+  running = true;
+ }
+  
+ public void Reset() {
+  elapsed = 0;
+  running = false;
+ }
+  
+ public float Elapsed
+ {
+  get
+  {
+   float time = elapsed;
+   if (running)
+   {
+    time += Time.time - started;
+   }
+
+   return time;
+  }
+ }
+}
+using UnityEngine;
+using System.Collections.Generic;
+
+//from http://wiki.unity3d.com/
+public class Triangulator
+{
+ private readonly List<Vector2> m_points = new List<Vector2>();
+
+ public Triangulator(List<Vector2> points)
+ {
+  m_points = points;
+ }
+
+ public int[] Triangulate()
+ {
+  List<int> indices = new List<int>();
+
+  int n = m_points.Count;
+  if (n < 3)
+   return indices.ToArray();
+
+  int[] V = new int[n];
+  if (Area() > 0)
+  {
+   for (int v = 0; v < n; v++)
+    V[v] = v;
+  }
+  else
+  {
+   for (int v = 0; v < n; v++)
+    V[v] = (n - 1) - v;
+  }
+
+  int nv = n;
+  int count = 2 * nv;
+  for (int m = 0, v = nv - 1; nv > 2;)
+  {
+   if ((count--) <= 0)
+    return indices.ToArray();
+
+   int u = v;
+   if (nv <= u)
+    u = 0;
+   v = u + 1;
+   if (nv <= v)
+    v = 0;
+   int w = v + 1;
+   if (nv <= w)
+    w = 0;
+
+   if (Snip(u, v, w, nv, V))
+   {
+    int a, b, c, s, t;
+    a = V[u];
+    b = V[v];
+    c = V[w];
+    indices.Add(a);
+    indices.Add(b);
+    indices.Add(c);
+    m++;
+    for (s = v, t = v + 1; t < nv; s++, t++)
+     V[s] = V[t];
+    nv--;
+    count = 2 * nv;
+   }
+  }
+
+  indices.Reverse();
+  return indices.ToArray();
+ }
+
+ private float Area()
+ {
+  int n = m_points.Count;
+  float A = 0.0f;
+  for (int p = n - 1, q = 0; q < n; p = q++)
+  {
+   Vector2 pval = m_points[p];
+   Vector2 qval = m_points[q];
+   A += pval.x * qval.y - qval.x * pval.y;
+  }
+  return (A * 0.5f);
+ }
+
+ private bool Snip(int u, int v, int w, int n, int[] V)
+ {
+  int p;
+  Vector2 A = m_points[V[u]];
+  Vector2 B = m_points[V[v]];
+  Vector2 C = m_points[V[w]];
+  if (Mathf.Epsilon > (((B.x - A.x) * (C.y - A.y)) - ((B.y - A.y) * (C.x - A.x))))
+   return false;
+  for (p = 0; p < n; p++)
+  {
+   if ((p == u) || (p == v) || (p == w))
+    continue;
+   Vector2 P = m_points[V[p]];
+   if (InsideTriangle(A, B, C, P))
+    return false;
+  }
+  return true;
+ }
+
+ private bool InsideTriangle(Vector2 A, Vector2 B, Vector2 C, Vector2 P)
+ {
+  float ax, ay, bx, by, cx, cy, apx, apy, bpx, bpy, cpx, cpy;
+  float cCROSSap, bCROSScp, aCROSSbp;
+
+  ax = C.x - B.x;
+  ay = C.y - B.y;
+  bx = A.x - C.x;
+  by = A.y - C.y;
+  cx = B.x - A.x;
+  cy = B.y - A.y;
+  apx = P.x - A.x;
+  apy = P.y - A.y;
+  bpx = P.x - B.x;
+  bpy = P.y - B.y;
+  cpx = P.x - C.x;
+  cpy = P.y - C.y;
+
+  aCROSSbp = ax * bpy - ay * bpx;
+  cCROSSap = cx * apy - cy * apx;
+  bCROSScp = bx * cpy - by * cpx;
+
+  return ((aCROSSbp >= 0.0f) && (bCROSScp >= 0.0f) && (cCROSSap >= 0.0f));
+ }
+
+}
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+
+public class ToggleButton : MonoBehaviour
+{
+ public string[] Items;
+ public int selectedIndex = 0;
+
+ public int Value
+ {
+  get
+  {
+   return selectedIndex;
+  }
+  set
+  {
+   if (selectedIndex != value)
+   {
+    selectedIndex = value;
+    RefreshText();
+   }
+  }
+ }
+
+ public bool BoolValue
+ {
+  get
+  {
+   return Value == 1;
+  }
+  set
+  {
+   Value = value ? 1 : 0;
+  }
+ }
+
+
+ // Use this for initialization
+ void Start ()
+ {
+  RefreshText();
+ }
+
+ void RefreshText()
+ {
+  if (Items.Length > 0)
+  {
+   GetComponentInChildren<Text>().text = Items[Value];
+  }
+ }
+}
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using System;
+using UnityEngine.Events;
+
+[System.Serializable]
+public class PointerEventHandler : UnityEvent<PointerEventData>
+{
+}
+
+public class UIPointerHandler : MonoBehaviour, IPointerEnterHandler, IPointerExitHandler
+{
+ public PointerEventHandler PointerEnter = new PointerEventHandler();
+
+ public PointerEventHandler PointerExit = new PointerEventHandler();
+
+ public void OnPointerEnter(PointerEventData eventData)
+ {
+  PointerEnter.Invoke(eventData);
+ }
+
+ public void OnPointerExit(PointerEventData eventData)
+ {
+  PointerExit.Invoke(eventData);
+ }
+}
+using System;
+
+public static class Utils
+{
+ public static uint ReadUnsignedInt(byte[] data, int offset)
+ {
+  unchecked
+  {
+   return (uint)(data[offset] | data[offset + 1] << 8 | data[offset + 2] << 16 | data[offset + 3] << 24);
+  }
+ }
+
+ public static int ReadInt(byte[] data, int offset)
+ {
+  unchecked
+  {
+   return (int)(data[offset] | data[offset + 1] << 8 | data[offset + 2] << 16 | data[offset + 3] << 24);
+  }
+ }
+
+ public static short ReadShort(byte[] data, int offset)
+ {
+  unchecked
+  {
+   return (short)(data[offset] | data[offset + 1] << 8);
+  }
+ }
+
+ public static ushort ReadUnsignedShort(byte[] data, int offset)
+ {
+  unchecked
+  {
+   return (ushort)(data[offset] | data[offset + 1] << 8);
+  }
+ }
+
+ public static void Write(short value, byte[] data, int offset)
+ {
+  unchecked
+  {
+   data[offset + 0] = (byte)(value & 0xFF);
+   data[offset + 1] = (byte)(value >> 8);
+  }
+ }
+
+ public static void Write(ushort value, byte[] data, int offset)
+ {
+  unchecked
+  {
+   data[offset + 0] = (byte)(value & 0xFF);
+   data[offset + 1] = (byte)(value >> 8);
+  }
+ }
+
+ public static void Write(uint value, byte[] data, int offset)
+ {
+  unchecked
+  {
+   data[offset + 0] = (byte)(value & 0xFF);
+   data[offset + 1] = (byte)(value >> 8);
+   data[offset + 2] = (byte)(value >> 16);
+   data[offset + 3] = (byte)(value >> 24);
+  }
+ }
+}
+using System;
+using System.Collections.Generic;
+using System.Text.RegularExpressions;
+
+
+public class VarParser
+{
+ readonly Dictionary<string, Dictionary<int, string>> sections
+  = new Dictionary<string, Dictionary<int, string>>();
+
+ public string GetText(string sectionName, int value)
+ {
+  Dictionary<int, string> section;
+  if (sections.TryGetValue(sectionName, out section))
+  {
+   string text;
+   if(section.TryGetValue(value, out text))
+   {
+    return text;
+   }
+  }
+
+  return string.Empty;
+ }
+
+ public void Parse(string filePath)
+ {
+  var allLines = System.IO.File.ReadAllLines(filePath);
+  Regex section = new Regex("^[A-Z](.*)$");
+  Regex item = new Regex("^(?<linenumber>[0-9]+)(-(?<next>[0-9]+))?(?<text>.*)");
+  Dictionary<int, string> currentSection = null;
+
+  foreach (string line in allLines)
+  {
+   //check if new section
+   Match sectionMatch = section.Match(line);
+   if (sectionMatch.Success)
+   {
+    currentSection = new Dictionary<int, string>();
+    sections.Add(sectionMatch.Value.Trim(), currentSection);
+   }
+   else if (currentSection != null)
+   {
+    //parse line if inside section
+    Match itemMatch = item.Match(line);
+    if (itemMatch.Success)
+    {
+     int lineNumber = int.Parse(itemMatch.Groups["linenumber"].Value);
+     string nextNumberString = itemMatch.Groups["next"].Value.Trim();
+     int nextNumber;
+
+     if (!string.IsNullOrEmpty(nextNumberString))
+     {
+      nextNumber = int.Parse(nextNumberString);
+     }
+     else
+     {
+      nextNumber = lineNumber;
+     }
+
+     string text = itemMatch.Groups["text"].Value.Trim();
+     if (!string.IsNullOrEmpty(text))
+     {
+      for(int i = lineNumber; i <= nextNumber ; i++)
+      {
+       currentSection[i] = text;
+      }
+     }
+    }
+   }
+  }
+ }
+}

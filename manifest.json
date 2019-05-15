@@ -1,0 +1,14 @@
+{
+  "manifest_version": 2,
+
+  "name": "Prototype Plugin",
+  "description": "This extension will check code smells in Games",
+  "version": "1.0",
+
+  "browser_action": {
+   "default_popup": "page1.html"
+  },
+  "permissions": [
+   "activeTab"
+   ]
+}
